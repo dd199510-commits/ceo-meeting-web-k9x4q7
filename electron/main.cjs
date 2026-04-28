@@ -8,6 +8,7 @@ const isDev = !app.isPackaged
 const devServerUrl = process.env.ELECTRON_RENDERER_URL || 'http://127.0.0.1:4173'
 const configStore = new ConfigStore(app)
 const aiJobService = createAiJobService(app, configStore)
+let mainWindow = null
 
 function canReachUrl(url, timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -26,7 +27,7 @@ function canReachUrl(url, timeoutMs = 1500) {
 }
 
 async function createMainWindow() {
-  const window = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1480,
     height: 980,
     minWidth: 1200,
@@ -41,7 +42,11 @@ async function createMainWindow() {
     },
   })
 
-  window.webContents.setWindowOpenHandler(({ url }) => {
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
   })
@@ -50,12 +55,12 @@ async function createMainWindow() {
     const serverReachable = await canReachUrl(devServerUrl)
 
     if (serverReachable) {
-      await window.loadURL(devServerUrl)
+      await mainWindow.loadURL(devServerUrl)
     } else {
-      await window.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+      await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
     }
   } else {
-    await window.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+    await mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
 }
 
