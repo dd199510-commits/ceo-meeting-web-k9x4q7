@@ -17,7 +17,7 @@ import {
   buildAIPrompt,
   buildExportBatch,
   detectAIScheduleConflicts,
-  optimizeInputForAI,
+  sanitizeAiInputMeetings,
   validateImportedSchedule,
 } from '../aiScheduler/aiSchedulerUtils'
 import { generateScheduleInstances } from '../schedule/scheduleUtils'
@@ -156,6 +156,19 @@ function formatQueueTime(value) {
   })
 }
 
+function formatJobProgress(job) {
+  const progress = job?.progress
+  if (!progress?.lastMessage) return ''
+
+  const counts = []
+  if (progress.reasoningChunkCount > 0) counts.push(`推理片段 ${progress.reasoningChunkCount}`)
+  if (progress.contentChunkCount > 0) counts.push(`结果片段 ${progress.contentChunkCount}`)
+  const countText = counts.length > 0 ? ` · ${counts.join(' / ')}` : ''
+  const timeText = progress.lastActivityAt ? ` · 最近活动 ${formatQueueTime(progress.lastActivityAt)}` : ''
+
+  return `${progress.lastMessage}${countText}${timeText}`
+}
+
 function formatQueueDateRange(range) {
   if (!range?.start && !range?.end) return '未记录排程范围'
   if (!range?.start) return `截至 ${range.end}`
@@ -163,14 +176,31 @@ function formatQueueDateRange(range) {
   return `${range.start} 至 ${range.end}`
 }
 
+function hasCompleteDateRange(range) {
+  return Boolean(range?.start && range?.end)
+}
+
+function hasValidDateRange(range) {
+  return hasCompleteDateRange(range) && range.start <= range.end
+}
+
+function areAiJobsEquivalent(leftJobs = [], rightJobs = []) {
+  if (leftJobs.length !== rightJobs.length) return false
+
+  return leftJobs.every((leftJob, index) => {
+    const rightJob = rightJobs[index]
+    return (
+      leftJob?.id === rightJob?.id &&
+      leftJob?.status === rightJob?.status &&
+      leftJob?.updatedAt === rightJob?.updatedAt &&
+      leftJob?.lastError === rightJob?.lastError
+    )
+  })
+}
+
 function getQueueSourceLabel(job) {
   if (job.provider === 'imported') return '外部导入'
   return 'AI 生成'
-}
-
-function getQueueModelLabel(job) {
-  if (job.provider === 'imported') return '导入方案'
-  return job.model || '未记录模型'
 }
 
 const MODEL_PRESETS = {
@@ -233,11 +263,20 @@ function hydrateImportedSchedule(parsed, exportBatch, rawExport) {
   }
 }
 
+const EMPTY_RANGE = { start: '', end: '' }
+
 export function PlanningWorkbench({
   meetings,
   aiState,
   setAiState,
+  planningTasks = [],
+  currentPlanningTaskId = '',
+  onCreatePlanningTask,
+  onCreateDraftTask,
+  onSelectPlanningTask,
+  onDeletePlanningTask,
   onApplyAiSchedule,
+  renderReviewBoard,
 }) {
   const [showConnectionModal, setShowConnectionModal] = useState(false)
   const [showConstraints, setShowConstraints] = useState(false)
@@ -245,19 +284,21 @@ export function PlanningWorkbench({
   const [selectedJobDetails, setSelectedJobDetails] = useState(null)
   const [showInputJsonModal, setShowInputJsonModal] = useState(false)
   const [showResultJsonModal, setShowResultJsonModal] = useState(false)
-  const [range, setRange] = useState(() => aiState.inputMeetings?.timeRange ?? getNextMonthRange())
+  const [showNewTaskModal, setShowNewTaskModal] = useState(false)
+  const [newTaskName, setNewTaskName] = useState('')
+  const [plannerView, setPlannerView] = useState('home')
+  const [activeWorkflowStep, setActiveWorkflowStep] = useState('prepare')
+  const [taskHomeFilter, setTaskHomeFilter] = useState('all')
+  const [range, setRange] = useState(() => ({ ...EMPTY_RANGE }))
   const [showInstancesModal, setShowInstancesModal] = useState(false)
   const [instancesView, setInstancesView] = useState('calendar')
-  const [lookupInput, setLookupInput] = useState('')
-  const [scheduleText, setScheduleText] = useState('')
-  const [scheduleError, setScheduleError] = useState('')
+  const [, setScheduleError] = useState('')
   const [ruleInput, setRuleInput] = useState('')
   const [slotInput, setSlotInput] = useState({ start: '', end: '', reason: '' })
   const [expandedRuleIds, setExpandedRuleIds] = useState([])
-  const [generatedInstances, setGeneratedInstances] = useState(() => aiState.inputMeetings?.meetings ?? [])
-  const [generatedSourceSignature, setGeneratedSourceSignature] = useState(
-    () => aiState.inputMeetings?.metadata?.sourceSignature ?? '',
-  )
+  const [editingRule, setEditingRule] = useState(null)
+  const [generatedInstances, setGeneratedInstances] = useState([])
+  const [generatedSourceSignature, setGeneratedSourceSignature] = useState('')
   const [aiJobs, setAiJobs] = useState([])
   const [submitError, setSubmitError] = useState('')
   const [submitBusy, setSubmitBusy] = useState(false)
@@ -273,11 +314,16 @@ export function PlanningWorkbench({
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [configBusy, setConfigBusy] = useState(false)
   const [configError, setConfigError] = useState('')
-  const [importMessage, setImportMessage] = useState('')
+  const [, setImportMessage] = useState('')
   const importSectionRef = useRef(null)
 
   const currentSourceSignature = useMemo(() => buildPlanningSourceSignature(meetings), [meetings])
-  const pendingInstances = useMemo(() => generateScheduleInstances(meetings, range), [meetings, range])
+  const hasCompleteRange = hasCompleteDateRange(range)
+  const hasValidRange = hasValidDateRange(range)
+  const pendingInstances = useMemo(
+    () => (hasValidRange ? generateScheduleInstances(meetings, range) : []),
+    [hasValidRange, meetings, range],
+  )
   const rawExport = useMemo(
     () => exportInstances(range, generatedInstances, generatedSourceSignature),
     [generatedInstances, generatedSourceSignature, range],
@@ -290,10 +336,6 @@ export function PlanningWorkbench({
     () => buildExportBatch(rawExport, aiState.exportBatch),
     [aiState.exportBatch, rawExport],
   )
-  const optimizedInput = useMemo(
-    () => optimizeInputForAI(rawExport, exportBatch, meetings),
-    [exportBatch, meetings, rawExport],
-  )
   const aiPrompt = useMemo(
     () => buildAIPrompt(rawExport, aiState.preferences, exportBatch, meetings),
     [aiState.preferences, exportBatch, meetings, rawExport],
@@ -305,7 +347,7 @@ export function PlanningWorkbench({
         : [],
     [aiState.scheduledMeetings],
   )
-  const months = useMemo(() => getMonthsInRange(range), [range])
+  const months = useMemo(() => (hasValidRange ? getMonthsInRange(range) : []), [hasValidRange, range])
   const meetingsByDate = useMemo(() => {
     return generatedInstances.reduce((accumulator, meeting) => {
       const current = accumulator.get(meeting.date) ?? []
@@ -314,16 +356,6 @@ export function PlanningWorkbench({
       return accumulator
     }, new Map())
   }, [generatedInstances])
-  const summary = useMemo(() => {
-    return generatedInstances.reduce(
-      (accumulator, item) => {
-        accumulator.total += 1
-        accumulator[item.frequency] = (accumulator[item.frequency] ?? 0) + 1
-        return accumulator
-      },
-      { total: 0 },
-    )
-  }, [generatedInstances])
   const desktopAiAvailable =
     typeof window !== 'undefined' &&
     window.aiScheduler &&
@@ -331,27 +363,15 @@ export function PlanningWorkbench({
   const currentBatchJobs = useMemo(() => {
     const batchId = exportBatch?.batchId
     if (!batchId) return []
-    return aiJobs.filter((job) => job.batchId === batchId)
-  }, [aiJobs, exportBatch])
-  const activeBatchJobs = useMemo(
-    () => currentBatchJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)),
-    [currentBatchJobs],
-  )
-  const finishedBatchJobs = useMemo(
-    () => currentBatchJobs.filter((job) => !ACTIVE_JOB_STATUSES.has(job.status)),
-    [currentBatchJobs],
-  )
-  const schemeHistory = useMemo(
-    () =>
-      aiJobs
-        .filter((job) => job.result && job.inputMeetings?.timeRange?.start && job.inputMeetings?.timeRange?.end)
-        .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()),
-    [aiJobs],
-  )
+    return aiJobs.filter((job) => job.batchId === batchId && job.planningTaskId === currentPlanningTaskId)
+  }, [aiJobs, currentPlanningTaskId, exportBatch])
+  const hasActiveCurrentBatchJob = currentBatchJobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status))
   const taskQueue = useMemo(
     () =>
-      [...aiJobs].sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()),
-    [aiJobs],
+      aiJobs
+        .filter((job) => job.planningTaskId && job.planningTaskId === currentPlanningTaskId)
+        .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()),
+    [aiJobs, currentPlanningTaskId],
   )
   const groupedTaskQueue = useMemo(() => {
     const aiGenerated = taskQueue.filter((job) => job.provider !== 'imported')
@@ -367,7 +387,7 @@ export function PlanningWorkbench({
       {
         key: 'imported',
         title: '外部导入',
-        description: '从排程调整导入并回写到任务队列的方案',
+        description: '从排程调整导入并回写到方案队列的方案',
         items: imported,
       },
     ].filter((group) => group.items.length > 0)
@@ -388,8 +408,9 @@ export function PlanningWorkbench({
   const canSubmitToAi = hasGeneratedPlan && !isGeneratedPlanStale
   const hasImportedSchedule = Boolean(aiState.scheduledMeetings?.scheduledMeetings?.length)
   const latestJobPhaseHint =
-    JOB_PHASE_HINTS[latestBatchJob?.status] ??
-    (latestBatchJob ? '任务状态已更新。' : '生成清单后即可直接提交给 AI 排程。')
+    formatJobProgress(latestBatchJob) ||
+    (JOB_PHASE_HINTS[latestBatchJob?.status] ??
+      (latestBatchJob ? '任务状态已更新。' : '生成清单后即可直接提交给 AI 排程。'))
 
   async function refreshAiConfig() {
     if (!desktopAiAvailable) return null
@@ -547,7 +568,10 @@ export function PlanningWorkbench({
     }
   }, [selectedSchemeJob])
   const displayedResultSummary = selectedSchemeData?.summary ?? (selectedSchemeJob ? null : aiResultSummary)
-  const displayedUnscheduledPreviewItems = selectedSchemeData?.unscheduledPreviewItems ?? (selectedSchemeJob ? [] : unscheduledPreviewItems)
+  const displayedUnscheduledPreviewItems = useMemo(
+    () => selectedSchemeData?.unscheduledPreviewItems ?? (selectedSchemeJob ? [] : unscheduledPreviewItems),
+    [selectedSchemeData, selectedSchemeJob, unscheduledPreviewItems],
+  )
   const selectedSchemeOverview = useMemo(() => {
     if (!selectedSchemeJob || !displayedResultSummary) return null
 
@@ -629,26 +653,34 @@ export function PlanningWorkbench({
     return Math.max(1, ...Array.from(selectedScheduledMeetingsByDate.values()).map((items) => items.length))
   }, [selectedScheduledMeetingsByDate])
   const planningInputInstances = hasGeneratedPlan ? generatedInstances : pendingInstances
+  const planningPreviewInstances = useMemo(
+    () => (hasGeneratedPlan ? generatedInstances : []),
+    [generatedInstances, hasGeneratedPlan],
+  )
   const planningMeetingsByDate = useMemo(() => {
-    return planningInputInstances.reduce((accumulator, meeting) => {
+    return planningPreviewInstances.reduce((accumulator, meeting) => {
       const current = accumulator.get(meeting.date) ?? []
       current.push(meeting)
       accumulator.set(meeting.date, current)
       return accumulator
     }, new Map())
-  }, [planningInputInstances])
+  }, [planningPreviewInstances])
   const maxDailyPlanningCount = useMemo(() => {
     return Math.max(1, ...Array.from(planningMeetingsByDate.values()).map((items) => items.length))
   }, [planningMeetingsByDate])
   const plannerRuleItems = useMemo(() => {
     const rules = aiState.preferences.rules.map((rule, index) => ({
       id: `rule-${index}`,
+      type: 'rule',
+      index,
       title: getRuleSummary(rule),
       detail: rule,
       badge: '规则',
     }))
     const slots = aiState.preferences.avoidTimeSlots.map((slot, index) => ({
       id: `slot-${index}`,
+      type: 'slot',
+      index,
       title: `${slot.start} - ${slot.end} 不排会`,
       detail: slot.reason ? `原因：${slot.reason}` : 'AI 排程时会避开这个时间段。',
       badge: '时段',
@@ -668,65 +700,15 @@ export function PlanningWorkbench({
   }, [planningInputInstances])
   const planningPreviewRows = useMemo(
     () =>
-      planningInputInstances
+      planningPreviewInstances
         .slice()
         .sort((left, right) => left.date.localeCompare(right.date) || left.name.localeCompare(right.name, 'zh-CN')),
-    [planningInputInstances],
+    [planningPreviewInstances],
   )
   const hasSelectedScheme = Boolean(selectedSchemeId && (selectedSchemeJob || selectedSchemeData || aiResultSummary))
   const handleCompletedJob = useEffectEvent((job, options = {}) => {
     importJobResult(job, options)
   })
-  const mappingLookup = useMemo(() => {
-    const normalizedInput = lookupInput.trim().toUpperCase()
-    if (!normalizedInput) return null
-
-    const instanceMap = new Map(rawExport.meetings.map((meeting) => [meeting.id, meeting]))
-    const taskRows = (exportBatch.taskMap ?? []).map((item) => {
-      const sourceMeeting = instanceMap.get(item.instanceId)
-      return {
-        key: item.taskId,
-        kind: 'task',
-        name: sourceMeeting?.name ?? '未知会议',
-        date: sourceMeeting?.date ?? item.date ?? '',
-        meetingId: item.meetingId ?? '',
-      }
-    })
-
-    const scheduledMeetingIds = new Set(
-      (exportBatch.taskMap ?? []).map((item) => item.meetingId).filter(Boolean),
-    )
-    const referenceMeetings = new Map()
-    rawExport.meetings.forEach((meeting) => {
-      ;(Array.isArray(meeting.noteMentions) ? meeting.noteMentions : []).forEach((mention) => {
-        if (!mention?.meetingId || scheduledMeetingIds.has(mention.meetingId)) {
-          return
-        }
-
-        if (!referenceMeetings.has(mention.meetingId)) {
-          referenceMeetings.set(mention.meetingId, {
-            meetingId: mention.meetingId,
-            name: mention.label || mention.meetingId,
-          })
-        }
-      })
-    })
-
-    const referenceRows = Array.from(referenceMeetings.values())
-      .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
-      .map((meeting, index) => ({
-        key: `R-${String(index + 1).padStart(3, '0')}`,
-        kind: 'reference',
-        name: meeting.name,
-        date: '',
-        meetingId: meeting.meetingId,
-      }))
-
-    return [...taskRows, ...referenceRows].find((item) => item.key === normalizedInput) ?? {
-      key: normalizedInput,
-      kind: 'missing',
-    }
-  }, [exportBatch.taskMap, lookupInput, rawExport.meetings])
 
   useEffect(() => {
     if (!desktopAiAvailable) return undefined
@@ -751,7 +733,8 @@ export function PlanningWorkbench({
       try {
         const jobs = await window.aiScheduler.listJobs()
         if (!cancelled) {
-          setAiJobs(Array.isArray(jobs) ? jobs : [])
+          const nextJobs = Array.isArray(jobs) ? jobs : []
+          setAiJobs((current) => (areAiJobsEquivalent(current, nextJobs) ? current : nextJobs))
         }
       } catch (error) {
         if (!cancelled) {
@@ -763,14 +746,14 @@ export function PlanningWorkbench({
     loadConfig()
     loadJobs()
 
-    const delay = currentBatchJobs.some((job) => ACTIVE_JOB_STATUSES.has(job.status)) ? 5000 : 15000
+    const delay = hasActiveCurrentBatchJob ? 5000 : 15000
     const timer = window.setInterval(loadJobs, delay)
 
     return () => {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [currentBatchJobs, desktopAiAvailable])
+  }, [desktopAiAvailable, hasActiveCurrentBatchJob])
 
   useEffect(() => {
     if (!latestBatchJob || latestBatchJob.status !== 'completed') return
@@ -819,7 +802,75 @@ export function PlanningWorkbench({
     }))
   }
 
+  function beginEditRule(rule) {
+    setEditingRule({
+      id: rule.id,
+      type: rule.type,
+      index: rule.index,
+      value: rule.type === 'rule' ? aiState.preferences.rules[rule.index] ?? '' : '',
+      slot:
+        rule.type === 'slot'
+          ? { ...(aiState.preferences.avoidTimeSlots[rule.index] ?? { start: '', end: '', reason: '' }) }
+          : { start: '', end: '', reason: '' },
+    })
+    setExpandedRuleIds([rule.id])
+  }
+
+  function saveEditingRule() {
+    if (!editingRule) return
+
+    if (editingRule.type === 'rule') {
+      const trimmedRule = editingRule.value.trim()
+      if (!trimmedRule) return
+
+      updatePreferences({
+        ...aiState.preferences,
+        rules: aiState.preferences.rules.map((rule, ruleIndex) => (ruleIndex === editingRule.index ? trimmedRule : rule)),
+      })
+      setExpandedRuleIds((current) => current.filter((ruleId) => ruleId !== editingRule.id))
+      setEditingRule(null)
+      return
+    }
+
+    if (!editingRule.slot.start || !editingRule.slot.end) return
+
+    updatePreferences({
+      ...aiState.preferences,
+      avoidTimeSlots: aiState.preferences.avoidTimeSlots.map((slot, slotIndex) =>
+        slotIndex === editingRule.index ? editingRule.slot : slot,
+      ),
+    })
+    setExpandedRuleIds((current) => current.filter((ruleId) => ruleId !== editingRule.id))
+    setEditingRule(null)
+  }
+
+  function deleteRuleAt(index) {
+    updatePreferences({
+      ...aiState.preferences,
+      rules: aiState.preferences.rules.filter((_, ruleIndex) => ruleIndex !== index),
+    })
+  }
+
+  function deleteSlotAt(index) {
+    updatePreferences({
+      ...aiState.preferences,
+      avoidTimeSlots: aiState.preferences.avoidTimeSlots.filter((_, slotIndex) => slotIndex !== index),
+    })
+  }
+
+  function updateRange(nextRange) {
+    setRange(nextRange)
+    if (generatedInstances.length > 0) {
+      clearGeneratedInstances()
+    }
+  }
+
   function generateAiInput() {
+    if (!hasValidDateRange(range)) {
+      setImportMessage('请先选择有效的开始和结束日期。')
+      return
+    }
+
     const nextExport = exportInstances(range, pendingInstances, currentSourceSignature)
     const nextBatch = buildExportBatch(nextExport)
     setGeneratedInstances(pendingInstances)
@@ -830,6 +881,17 @@ export function PlanningWorkbench({
       inputMeetings: nextExport,
       exportBatch: nextBatch,
     }))
+    onCreatePlanningTask?.({
+      aiState: {
+        ...aiState,
+        inputMeetings: nextExport,
+        exportBatch: nextBatch,
+      },
+      status: 'list_ready',
+      timeRange: nextExport.timeRange,
+      generatedCount: nextExport.meetings.length,
+    })
+    setActiveWorkflowStep('prepare')
   }
 
   function clearGeneratedInstances() {
@@ -842,6 +904,7 @@ export function PlanningWorkbench({
       ...current,
       inputMeetings: null,
       exportBatch: null,
+      scheduledMeetings: null,
     }))
   }
 
@@ -870,43 +933,9 @@ export function PlanningWorkbench({
     })
   }
 
-  function importAiResult() {
-    try {
-      if (!exportBatch?.taskMap?.length || !rawExport?.meetings?.length) {
-        setScheduleError('请先生成待排程清单，再导入 AI 返回结果。')
-        return
-      }
-
-      if (!scheduleText.trim()) {
-        if (latestBatchJob?.result) {
-          importJobResult(latestBatchJob, { markImported: true, importToReview: false })
-          return
-        }
-
-        setScheduleError('当前文本框为空。你可以粘贴 AI 返回的 JSON，或先点击上方任务卡片里的“导入结果”。')
-        return
-      }
-
-      const parsed = hydrateImportedSchedule(validateImportedSchedule(scheduleText), exportBatch, rawExport)
-
-      setAiState((current) => ({
-        ...current,
-        inputMeetings: rawExport,
-        exportBatch,
-        scheduledMeetings: parsed,
-      }))
-      setScheduleText('')
-      setScheduleError('')
-      setImportMessage(`已导入 ${parsed.scheduledMeetings.length} 条 AI 排程结果，请继续导入到审核排程。`)
-      importSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    } catch (error) {
-      setScheduleError(error.message || '导入 AI 排程结果失败，请检查 JSON 格式。')
-    }
-  }
-
   async function submitAiJob() {
     if (!desktopAiAvailable) {
-      setSubmitError('当前运行环境未挂载 Electron AI 服务，请使用桌面版。')
+      setSubmitError('当前运行环境未初始化 AI 服务，请刷新后重试。')
       return
     }
 
@@ -920,19 +949,32 @@ export function PlanningWorkbench({
     setImportMessage('')
 
     try {
+      const safeRawExport = sanitizeAiInputMeetings(rawExport)
       await window.aiScheduler.submitJob({
         batchId: exportBatch.batchId,
         provider: currentProvider,
         model: aiSettings.model || currentProviderOption.defaultModel,
         prompt: aiPrompt,
-        inputMeetings: rawExport,
+        inputMeetings: safeRawExport,
         preferences: aiState.preferences,
         exportBatch,
+        planningTaskId: currentPlanningTaskId,
         promptVersion: 'v1',
       })
 
       const jobs = await window.aiScheduler.listJobs()
       setAiJobs(Array.isArray(jobs) ? jobs : [])
+      onCreatePlanningTask?.({
+        aiState: {
+          ...aiState,
+          inputMeetings: rawExport,
+          exportBatch,
+        },
+        status: 'ai_running',
+        timeRange: rawExport.timeRange,
+        generatedCount: rawExport.meetings.length,
+      })
+      setActiveWorkflowStep('ai')
     } catch (error) {
       setSubmitError(error.message)
     } finally {
@@ -940,21 +982,31 @@ export function PlanningWorkbench({
     }
   }
 
-  async function retryAiJob(jobId) {
-    if (!desktopAiAvailable || !jobId) return
+  async function deleteQueueJob(job, event) {
+    event.stopPropagation()
+    if (!desktopAiAvailable || !job?.id || typeof window.aiScheduler?.deleteJob !== 'function') {
+      setSubmitError('当前运行环境不支持删除方案。')
+      return
+    }
 
-    setSubmitBusy(true)
-    setSubmitError('')
-    setImportMessage('')
+    const confirmed = window.confirm(
+      `确定删除这个方案吗？\n\n${getQueueSourceLabel(job)} · ${formatQueueDateRange(job.inputMeetings?.timeRange)}`,
+    )
+    if (!confirmed) return
 
     try {
-      await window.aiScheduler.retryJob(jobId)
+      await window.aiScheduler.deleteJob(job.id)
       const jobs = await window.aiScheduler.listJobs()
       setAiJobs(Array.isArray(jobs) ? jobs : [])
+      if (selectedSchemeId === job.id) {
+        setSelectedSchemeId('')
+        setSelectedJobDetails(null)
+      }
+      if (aiSettings.lastImportedJobId === job.id) {
+        updateAiSettings({ lastImportedJobId: '' })
+      }
     } catch (error) {
-      setSubmitError(error.message)
-    } finally {
-      setSubmitBusy(false)
+      setSubmitError(error.message || '删除方案失败。')
     }
   }
 
@@ -1020,6 +1072,89 @@ export function PlanningWorkbench({
     refreshAiConfig()
   }
 
+  function getPlanningTaskStatusLabel(status) {
+    if (status === 'scheduled') return '已排程'
+    if (status === 'ai_done') return 'AI 完成'
+    if (status === 'ai_running') return 'AI 中'
+    if (status === 'list_ready') return '清单'
+    return '草稿'
+  }
+
+  function getPlanningTaskStatusGroup(status) {
+    if (status === 'scheduled') return 'scheduled'
+    if (status === 'draft') return 'draft'
+    return 'active'
+  }
+
+  function startNewPlanningTask() {
+    setNewTaskName('')
+    setShowNewTaskModal(true)
+  }
+
+  function confirmNewPlanningTask(event) {
+    event?.preventDefault()
+    const normalizedTaskName = newTaskName.trim()
+
+    if (!normalizedTaskName) {
+      return
+    }
+
+    setShowNewTaskModal(false)
+    clearGeneratedInstances()
+    setRange({ ...EMPTY_RANGE })
+    onCreateDraftTask?.({
+      createNew: true,
+      status: 'draft',
+      timeRange: null,
+      name: normalizedTaskName,
+      aiState: {
+        ...aiState,
+        inputMeetings: null,
+        exportBatch: null,
+        scheduledMeetings: null,
+      },
+      generatedCount: 0,
+      scheduledCount: 0,
+    })
+    setTaskHomeFilter('all')
+    setActiveWorkflowStep('prepare')
+    setPlannerView('workspace')
+  }
+
+  function openPlanningTask(task) {
+    onSelectPlanningTask?.(task.id)
+    if (task.aiState?.inputMeetings?.timeRange) {
+      setRange(task.aiState.inputMeetings.timeRange)
+      setGeneratedInstances(task.aiState.inputMeetings.meetings ?? [])
+      setGeneratedSourceSignature(task.aiState.inputMeetings.metadata?.sourceSignature ?? '')
+    } else {
+      const nextRange = task.timeRange ?? EMPTY_RANGE
+      setRange({ ...nextRange })
+      setGeneratedInstances([])
+      setGeneratedSourceSignature('')
+      setAiState((current) => ({
+        ...current,
+        inputMeetings: null,
+        exportBatch: null,
+        scheduledMeetings: null,
+      }))
+    }
+    setActiveWorkflowStep(task.status === 'scheduled' ? 'review' : task.status === 'draft' || task.status === 'list_ready' ? 'prepare' : 'ai')
+    setPlannerView('workspace')
+  }
+
+  function deletePlanningTask(task) {
+    if (!task?.id) return
+    const confirmed = window.confirm(`确定删除排程任务“${task.name}”吗？`)
+    if (!confirmed) return
+    onDeletePlanningTask?.(task.id)
+    if (task.id === currentPlanningTaskId) {
+      clearGeneratedInstances()
+      setPlannerView('home')
+      setActiveWorkflowStep('prepare')
+    }
+  }
+
   function importJobResult(job, options = {}) {
     try {
       if (!job?.result) {
@@ -1057,12 +1192,22 @@ export function PlanningWorkbench({
       } else {
         setAiState(nextAiState)
       }
+      onCreatePlanningTask?.({
+        aiState: nextAiState,
+        status: options.importToReview ? 'scheduled' : 'ai_done',
+        timeRange: sourceInputMeetings.timeRange,
+        generatedCount: sourceInputMeetings.meetings?.length ?? 0,
+        scheduledCount: parsed.scheduledMeetings.length,
+      })
       setScheduleError('')
       setImportMessage(
         options.importToReview
           ? `已导入 ${parsed.scheduledMeetings.length} 条 AI 排程结果，正在进入排程调整。`
           : `已导入 ${parsed.scheduledMeetings.length} 条 AI 排程结果，请继续导入到审核排程。`,
       )
+      if (options.importToReview) {
+        setActiveWorkflowStep('review')
+      }
       importSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     } catch (error) {
       setScheduleError(error.message)
@@ -1178,61 +1323,388 @@ export function PlanningWorkbench({
     )
   }
 
+  const taskHomeStats = planningTasks.reduce(
+    (stats, task) => {
+      const count = task.scheduledCount || task.generatedCount || 0
+      stats.totalTasks += 1
+      stats.totalMeetings += count
+      if (task.status === 'scheduled') {
+        stats.scheduledTasks += 1
+        stats.scheduledMeetings += count
+      } else {
+        stats.pendingTasks += 1
+      }
+      return stats
+    },
+    {
+      totalTasks: 0,
+      totalMeetings: 0,
+      scheduledTasks: 0,
+      scheduledMeetings: 0,
+      pendingTasks: 0,
+    },
+  )
+  const taskHomeFilters = [
+    ['all', '全部', planningTasks.length],
+    ['draft', '草稿', planningTasks.filter((task) => getPlanningTaskStatusGroup(task.status) === 'draft').length],
+    ['active', '进行中', planningTasks.filter((task) => getPlanningTaskStatusGroup(task.status) === 'active').length],
+    ['scheduled', '已排程', planningTasks.filter((task) => getPlanningTaskStatusGroup(task.status) === 'scheduled').length],
+  ]
+  const visiblePlanningTasks = taskHomeFilter === 'all'
+    ? planningTasks
+    : planningTasks.filter((task) => getPlanningTaskStatusGroup(task.status) === taskHomeFilter)
+
+  if (plannerView === 'home') {
+    return (
+      <div className="planner-task-home">
+        <section className="planner-task-home-toolbar">
+          <div>
+            <span>排程任务中心</span>
+            <h2>创建、继续或查看历史排程任务</h2>
+          </div>
+          <button type="button" className="primary-button" onClick={startNewPlanningTask}>
+            <Bot size={16} />
+            新建排程任务
+          </button>
+        </section>
+
+        <div className="planner-task-home-grid">
+          <section className="panel planner-task-home-list-panel">
+            <div className="planner-task-home-list-head">
+              <div>
+                <strong>任务历史</strong>
+                <span>{visiblePlanningTasks.length} / {planningTasks.length} 个任务</span>
+              </div>
+            </div>
+            <div className="planner-task-home-list">
+              {visiblePlanningTasks.length > 0 ? visiblePlanningTasks.map((task) => (
+                <article key={task.id} className={task.id === currentPlanningTaskId ? 'planner-task-home-item planner-task-home-item-active' : 'planner-task-home-item'}>
+                  <button type="button" className="planner-task-home-item-main" onClick={() => openPlanningTask(task)}>
+                    <span className={`planner-task-status-pill planner-task-status-${task.status || 'draft'}`}>
+                      {getPlanningTaskStatusLabel(task.status)}
+                    </span>
+                    <strong>{task.name}</strong>
+                    <em>{task.updatedAt ? new Date(task.updatedAt).toLocaleString() : '尚未更新'}</em>
+                  </button>
+                  <div className="planner-task-home-item-meta">
+                    <span>{task.scheduledCount || task.generatedCount || 0} 条</span>
+                    <button type="button" className="ghost-button" onClick={() => openPlanningTask(task)}>
+                      继续
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button planner-task-delete-button"
+                      onClick={() => deletePlanningTask(task)}
+                      aria-label={`删除 ${task.name}`}
+                      title="删除任务"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </article>
+              )) : (
+                <div className="planner-task-home-empty">
+                  <strong>{planningTasks.length > 0 ? '当前筛选下暂无任务' : '暂无排程任务'}</strong>
+                  <p>{planningTasks.length > 0 ? '切换筛选条件查看其他任务。' : '点击“新建排程任务”开始创建第一个月度或阶段排程。'}</p>
+                </div>
+              )}
+            </div>
+          </section>
+
+          <aside className="planner-task-home-side">
+            <section className="panel planner-task-summary-panel">
+              <div className="planner-task-home-list-head">
+                <div>
+                  <strong>任务概览</strong>
+                  <span>按历史任务汇总</span>
+                </div>
+              </div>
+              <div className="planner-task-summary-grid">
+                <div>
+                  <span>任务总数</span>
+                  <strong>{taskHomeStats.totalTasks}</strong>
+                </div>
+                <div>
+                  <span>已排程会议</span>
+                  <strong>{taskHomeStats.scheduledMeetings}</strong>
+                </div>
+                <div>
+                  <span>待处理任务</span>
+                  <strong>{taskHomeStats.pendingTasks}</strong>
+                </div>
+              </div>
+            </section>
+
+            <section className="panel planner-task-filter-panel">
+              <div className="planner-task-home-list-head">
+                <div>
+                  <strong>快速筛选</strong>
+                  <span>按任务状态查看</span>
+                </div>
+              </div>
+              <div className="planner-task-filter-chips">
+                {taskHomeFilters.map(([key, label, count]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className={taskHomeFilter === key ? 'planner-task-filter-chip planner-task-filter-chip-active' : 'planner-task-filter-chip'}
+                    onClick={() => setTaskHomeFilter(key)}
+                  >
+                    <span>{label}</span>
+                    <strong>{count}</strong>
+                  </button>
+                ))}
+              </div>
+            </section>
+          </aside>
+        </div>
+
+        {showNewTaskModal ? (
+          <div className="modal-backdrop modal-open" onClick={() => setShowNewTaskModal(false)}>
+            <form className="modal-card modal-card-open planner-new-task-modal" onSubmit={confirmNewPlanningTask} onClick={(event) => event.stopPropagation()}>
+              <div className="modal-header">
+                <div>
+                  <h3>新建排程任务</h3>
+                  <p className="meeting-notes">给这组排程方案起一个便于识别的名称。</p>
+                </div>
+                <button type="button" className="icon-button" onClick={() => setShowNewTaskModal(false)}>
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="field">
+                <span>任务名称</span>
+                <input
+                  autoFocus
+                  type="text"
+                  value={newTaskName}
+                  onChange={(event) => setNewTaskName(event.target.value)}
+                  placeholder="例如：6月例会排程"
+                />
+              </label>
+              <div className="panel-actions">
+                <button type="button" className="ghost-button" onClick={() => setShowNewTaskModal(false)}>
+                  取消
+                </button>
+                <button type="submit" className="primary-button" disabled={!newTaskName.trim()}>
+                  创建任务
+                </button>
+              </div>
+            </form>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
   return (
     <div className="planner-generation-page">
+      <section className="panel planner-task-workflow-head">
+        <div className="planner-task-title">
+          <span>当前排程任务</span>
+          <h2>{hasCompleteRange ? formatQueueDateRange(range) : '待选择排程范围'}</h2>
+          <p>
+            {hasGeneratedPlan
+              ? `${generatedInstances.length} 个待排会议实例`
+              : hasValidRange
+                ? `预计 ${pendingInstances.length} 个会议实例`
+                : '选择范围后生成待排清单'}
+          </p>
+        </div>
+        <div className="planner-task-workflow-actions">
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => setPlannerView('home')}
+          >
+            返回任务首页
+          </button>
+          {activeWorkflowStep !== 'ai' ? (
+            <button
+              type="button"
+              className="primary-button planner-workflow-primary"
+              onClick={() => setActiveWorkflowStep('ai')}
+              disabled={!hasGeneratedPlan}
+            >
+              进入 AI 排程
+            </button>
+          ) : null}
+          <div className="planner-task-stepper" role="tablist" aria-label="排程任务步骤">
+            {[
+              ['prepare', '1', '清单准备'],
+              ['ai', '2', 'AI 排程'],
+              ['review', '3', '排程调整'],
+            ].map(([key, index, label]) => (
+              <button
+                key={key}
+                type="button"
+                className={activeWorkflowStep === key ? 'planner-task-step planner-task-step-active' : 'planner-task-step'}
+                onClick={() => setActiveWorkflowStep(key)}
+                role="tab"
+                aria-selected={activeWorkflowStep === key}
+              >
+                <span>{index}</span>
+                <strong>{label}</strong>
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <div className="planner-task-layout">
+        <div className="planner-task-main">
+      {activeWorkflowStep === 'prepare' ? (
+      <div className="planner-prepare-workspace">
       <section className="panel planner-step-card planner-step-card-range">
         <div className="planner-step-card-head">
-          <strong>步骤 1</strong>
-          <h2>范围与清单</h2>
-          <span>选择时间范围</span>
+          <strong>清单准备</strong>
+          <h2>范围与生成</h2>
+          <span>选择时间范围并生成待排清单</span>
         </div>
         <div className="planner-range-fields">
           <label className="field">
             <span>开始</span>
-            <input type="date" value={range.start} onChange={(event) => setRange({ ...range, start: event.target.value })} />
+            <input type="date" value={range.start} onChange={(event) => updateRange({ ...range, start: event.target.value })} />
           </label>
           <label className="field">
             <span>结束</span>
-            <input type="date" value={range.end} onChange={(event) => setRange({ ...range, end: event.target.value })} />
+            <input type="date" value={range.end} onChange={(event) => updateRange({ ...range, end: event.target.value })} />
           </label>
-          <button className="primary-button planner-generate-button" onClick={generateAiInput}>
+          <div className="planner-range-presets">
+            <button type="button" className="ghost-button" onClick={() => updateRange(getNextMonthRange())}>
+              下个月
+            </button>
+            <button type="button" className="ghost-button" onClick={() => updateRange({ ...EMPTY_RANGE })}>
+              清空
+            </button>
+          </div>
+          <button className="primary-button planner-generate-button" onClick={generateAiInput} disabled={!hasValidRange}>
             <Bot size={16} />
             {hasGeneratedPlan ? '更新清单' : '生成清单'}
           </button>
         </div>
-        <div className={hasGeneratedPlan ? 'planner-ready-card planner-ready-card-ok' : 'planner-ready-card'}>
-          <Check size={16} />
-          <div>
-            <strong>{hasGeneratedPlan ? '清单已准备就绪' : '等待生成清单'}</strong>
-            <span>
-              {hasGeneratedPlan
-                ? `已生成 ${exportBatch.taskMap.length} 个任务编号`
-                : `当前范围预计生成 ${pendingInstances.length} 条会议实例`}
-            </span>
-          </div>
-        </div>
-        <div className="planner-count-grid">
-          <div className="planner-count-card planner-count-card-total">
-            <span>待排程</span>
-            <strong>{planningInputSummary.total}</strong>
-          </div>
-          {Object.entries(FREQUENCY_LABELS).map(([key, label]) => (
-            <div key={key} className={`planner-count-card planner-count-card-${key}`}>
-              <span>{label}</span>
-              <strong>{planningInputSummary[key] ?? 0}</strong>
-            </div>
-          ))}
-        </div>
         <div className="planner-rule-list">
           <div className="planner-rule-list-head">
             <strong>约束规则</strong>
-            <span>生效中 {plannerRuleItems.length} 条</span>
+            <div className="planner-rule-head-actions">
+              <span>生效中 {plannerRuleItems.length} 条</span>
+              <button className="ghost-button" type="button" onClick={() => setShowConstraints((current) => !current)}>
+                新增
+              </button>
+            </div>
           </div>
+          {showConstraints ? (
+            <div className="planner-inline-constraint-editor planner-constraint-editor-card">
+              <label className="field">
+                <span>新增排程规则</span>
+                <div className="simple-form">
+                  <input value={ruleInput} onChange={(event) => setRuleInput(event.target.value)} placeholder="例如：周会优先安排上午" />
+                  <button
+                    className="ghost-button"
+                    onClick={() => {
+                      if (!ruleInput.trim()) return
+                      updatePreferences({
+                        ...aiState.preferences,
+                        rules: [...aiState.preferences.rules, ruleInput.trim()],
+                      })
+                      setRuleInput('')
+                    }}
+                  >
+                    新增
+                  </button>
+                </div>
+              </label>
+              <label className="field">
+                <span>新增避开时段</span>
+                <div className="simple-form">
+                  <input type="time" value={slotInput.start} onChange={(event) => setSlotInput({ ...slotInput, start: event.target.value })} />
+                  <input type="time" value={slotInput.end} onChange={(event) => setSlotInput({ ...slotInput, end: event.target.value })} />
+                  <input placeholder="原因" value={slotInput.reason} onChange={(event) => setSlotInput({ ...slotInput, reason: event.target.value })} />
+                  <button
+                    className="ghost-button"
+                    onClick={() => {
+                      if (!slotInput.start || !slotInput.end) return
+                      updatePreferences({
+                        ...aiState.preferences,
+                        avoidTimeSlots: [...aiState.preferences.avoidTimeSlots, slotInput],
+                      })
+                      setSlotInput({ start: '', end: '', reason: '' })
+                    }}
+                  >
+                    新增
+                  </button>
+                </div>
+              </label>
+            </div>
+          ) : null}
           {plannerRuleItems.map((rule) => {
             const isExpanded = expandedRuleIds.includes(rule.id)
+            const isEditing = editingRule?.id === rule.id
+            const ruleItemClassName = [
+              'planner-rule-item',
+              isExpanded ? 'planner-rule-item-expanded' : '',
+              isEditing ? 'planner-rule-item-editing' : '',
+            ].filter(Boolean).join(' ')
+            const activeRuleType = isEditing ? editingRule.type : rule.type
+            const inlineRuleEditor = isEditing || isExpanded ? (
+              <div className={`planner-rule-inline-editor planner-rule-inline-editor-${activeRuleType}`}>
+                {activeRuleType === 'rule' ? (
+                  <textarea
+                    className="planner-rule-detail-inline planner-rule-detail-editor"
+                    value={isEditing ? editingRule.value : rule.detail}
+                    readOnly={!isEditing}
+                    tabIndex={isEditing ? 0 : -1}
+                    onChange={(event) =>
+                      isEditing ? setEditingRule((current) => ({ ...current, value: event.target.value })) : null
+                    }
+                    rows={3}
+                  />
+                ) : isEditing ? (
+                  <div className="planner-rule-slot-editor">
+                    <input
+                      type="time"
+                      value={editingRule.slot.start}
+                      onChange={(event) =>
+                        setEditingRule((current) => ({
+                          ...current,
+                          slot: { ...current.slot, start: event.target.value },
+                        }))
+                      }
+                    />
+                    <input
+                      type="time"
+                      value={editingRule.slot.end}
+                      onChange={(event) =>
+                        setEditingRule((current) => ({
+                          ...current,
+                          slot: { ...current.slot, end: event.target.value },
+                        }))
+                      }
+                    />
+                    <input
+                      value={editingRule.slot.reason}
+                      onChange={(event) =>
+                        setEditingRule((current) => ({
+                          ...current,
+                          slot: { ...current.slot, reason: event.target.value },
+                        }))
+                      }
+                      placeholder="原因"
+                    />
+                  </div>
+                ) : (
+                  <textarea
+                    className="planner-rule-detail-inline planner-rule-detail-editor"
+                    value={rule.detail}
+                    readOnly
+                    tabIndex={-1}
+                    rows={2}
+                  />
+                )}
+              </div>
+            ) : null
 
             return (
-              <div key={rule.id} className={isExpanded ? 'planner-rule-item planner-rule-item-expanded' : 'planner-rule-item'}>
+              <div key={rule.id} className={ruleItemClassName}>
                 <button
                   type="button"
                   className={isExpanded ? 'planner-rule-expand planner-rule-expand-open' : 'planner-rule-expand'}
@@ -1249,9 +1721,38 @@ export function PlanningWorkbench({
                 </button>
                 <div className="planner-rule-copy">
                   <span>{rule.title}</span>
-                  {isExpanded ? <p>{rule.detail}</p> : null}
+                </div>
+                <div className="planner-rule-actions">
+                  {isEditing ? (
+                    <>
+                      <button type="button" className="primary-button" onClick={saveEditingRule}>
+                        保存
+                      </button>
+                      <button type="button" className="ghost-button" onClick={() => setEditingRule(null)}>
+                        取消
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => beginEditRule(rule)}
+                      >
+                        编辑
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        onClick={() => (rule.type === 'rule' ? deleteRuleAt(rule.index) : deleteSlotAt(rule.index))}
+                      >
+                        删除
+                      </button>
+                    </>
+                  )}
                 </div>
                 <em>{rule.badge}</em>
+                {inlineRuleEditor}
               </div>
             )
           })}
@@ -1262,57 +1763,9 @@ export function PlanningWorkbench({
               </div>
             </div>
           ) : null}
-          <button className="ghost-button" type="button" onClick={() => setShowConstraints((current) => !current)}>
-            管理约束规则
-          </button>
         </div>
-        {showConstraints ? (
-          <div className="planner-constraint-editor planner-constraint-editor-card">
-            <label className="field">
-              <span>新增排程规则</span>
-              <div className="simple-form">
-                <input value={ruleInput} onChange={(event) => setRuleInput(event.target.value)} placeholder="例如：周会优先安排上午" />
-                <button
-                  className="ghost-button"
-                  onClick={() => {
-                    if (!ruleInput.trim()) return
-                    updatePreferences({
-                      ...aiState.preferences,
-                      rules: [...aiState.preferences.rules, ruleInput.trim()],
-                    })
-                    setRuleInput('')
-                  }}
-                >
-                  新增
-                </button>
-              </div>
-            </label>
-            <label className="field">
-              <span>新增避开时段</span>
-              <div className="simple-form">
-                <input type="time" value={slotInput.start} onChange={(event) => setSlotInput({ ...slotInput, start: event.target.value })} />
-                <input type="time" value={slotInput.end} onChange={(event) => setSlotInput({ ...slotInput, end: event.target.value })} />
-                <input placeholder="原因" value={slotInput.reason} onChange={(event) => setSlotInput({ ...slotInput, reason: event.target.value })} />
-                <button
-                  className="ghost-button"
-                  onClick={() => {
-                    if (!slotInput.start || !slotInput.end) return
-                    updatePreferences({
-                      ...aiState.preferences,
-                      avoidTimeSlots: [...aiState.preferences.avoidTimeSlots, slotInput],
-                    })
-                    setSlotInput({ start: '', end: '', reason: '' })
-                  }}
-                >
-                  新增
-                </button>
-              </div>
-            </label>
-          </div>
-        ) : null}
         <div className="planner-status-table">
-          <div><span>数据来源</span><strong>会议库（{meetings.length} 条会议模板）</strong></div>
-          <div><span>覆盖范围</span><strong>{range.start} ~ {range.end}</strong></div>
+          <div><span>覆盖范围</span><strong>{hasCompleteRange ? `${range.start} ~ ${range.end}` : '未选择'}</strong></div>
           <div><span>预计冲突数</span><strong>{scheduleConflicts.length}</strong></div>
         </div>
       </section>
@@ -1320,13 +1773,42 @@ export function PlanningWorkbench({
       <section className="panel planner-step-card planner-step-card-preview">
         <div className="planner-step-card-head planner-step-card-head-row">
           <div>
-            <strong>步骤 2</strong>
-            <h2>清单预览与日期分布</h2>
+            <strong>清单准备</strong>
+            <h2>清单浏览</h2>
+          </div>
+          <div className="planner-preview-summary-strip">
+            <div className={hasGeneratedPlan ? 'planner-ready-card planner-ready-card-ok' : 'planner-ready-card'}>
+              <Check size={16} />
+              <div>
+                <strong>{hasGeneratedPlan ? '已生成' : '待生成'}</strong>
+                <span>
+                  {hasGeneratedPlan
+                    ? `${exportBatch.taskMap.length} 条`
+                    : hasValidRange
+                      ? `预计 ${pendingInstances.length} 条`
+                      : hasCompleteRange
+                        ? '日期有误'
+                        : '未选日期'}
+                </span>
+              </div>
+            </div>
+            <div className="planner-count-grid">
+              <div className="planner-count-card planner-count-card-total">
+                <span>待排程</span>
+                <strong>{planningInputSummary.total}</strong>
+              </div>
+              {Object.entries(FREQUENCY_LABELS).map(([key, label]) => (
+                <div key={key} className={`planner-count-card planner-count-card-${key}`}>
+                  <span>{label}</span>
+                  <strong>{planningInputSummary[key] ?? 0}</strong>
+                </div>
+              ))}
+            </div>
           </div>
           <div className="planner-preview-actions">
             <button className="ghost-button" onClick={() => setShowInstancesModal(true)} disabled={!hasGeneratedPlan}>
               <Eye size={16} />
-              查看完整清单
+              完整清单
             </button>
           </div>
         </div>
@@ -1346,8 +1828,8 @@ export function PlanningWorkbench({
             <span>排程信息</span>
           </div>
           <div className="planner-instance-preview-list">
-            {planningPreviewRows.map((item) => {
-              const constraintText = item.notes || aiState.preferences.rules[0] || '-'
+            {hasGeneratedPlan ? planningPreviewRows.map((item) => {
+              const constraintText = item.notes || '-'
               const constraintSummary = constraintText === '-' ? '-' : getRuleSummary(constraintText)
 
               return (
@@ -1363,31 +1845,36 @@ export function PlanningWorkbench({
                   </div>
                 </article>
               )
-            })}
-            {planningPreviewRows.length === 0 ? (
+            }) : null}
+            {!hasGeneratedPlan ? (
+              <div className="planner-instance-preview-empty">点击“生成清单”后显示待排会议实例。</div>
+            ) : planningPreviewRows.length === 0 ? (
               <div className="planner-instance-preview-empty">当前范围内暂无会议实例。</div>
             ) : null}
           </div>
         </div>
         <div className="planner-preview-bottom">
           <div className="planner-mini-calendar planner-distribution-calendar-list">
-            {months.length > 0 ? (
+            {hasGeneratedPlan && months.length > 0 ? (
               months.map((monthItem) => (
                 <div className="planner-distribution-month" key={`${monthItem.year}-${monthItem.month}`}>
                   {renderDistributionCalendarMonth(monthItem.year, monthItem.month)}
                 </div>
               ))
             ) : (
-              <div className="info-note">暂无日期预览</div>
+              <div className="info-note">{hasGeneratedPlan ? '暂无日期预览' : '生成清单后显示日期分布'}</div>
             )}
           </div>
         </div>
       </section>
+      </div>
+      ) : null}
 
+      {activeWorkflowStep === 'ai' ? (
       <aside className="panel planner-step-card planner-step-card-ai">
         <div className="planner-step-card-head">
-          <strong>步骤 3</strong>
-          <h2>AI 排程任务</h2>
+          <strong>步骤 2</strong>
+          <h2>AI 排程</h2>
           <span>AI 配置</span>
         </div>
         <div className="planner-provider-toggle">
@@ -1443,10 +1930,10 @@ export function PlanningWorkbench({
 
         <div className="planner-task-section">
           <div className="planner-task-section-head">
-            <strong>任务队列与历史</strong>
-            <span>全部 {taskQueue.length}</span>
+            <strong>方案队列与历史</strong>
+            <span>当前任务下 {taskQueue.length} 个方案</span>
           </div>
-          {taskQueue.length > 0 ? (
+          {groupedTaskQueue.length > 0 ? (
             <div className="planner-task-queue-list">
               {groupedTaskQueue.map((group) => (
                 <section key={group.key} className="planner-queue-group">
@@ -1462,28 +1949,57 @@ export function PlanningWorkbench({
                       const timeRange = job.inputMeetings?.timeRange
                       const isCompleted = job.status === 'completed'
                       return (
-                        <button
+                        <div
                           key={job.id}
-                          type="button"
+                          role="button"
+                          tabIndex={0}
                           className="planner-scheme-chip planner-queue-item"
                           onClick={() => setSelectedSchemeId(job.id)}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault()
+                              setSelectedSchemeId(job.id)
+                            }
+                          }}
                         >
                           <div className="planner-scheme-chip-head">
                             <div className="planner-scheme-chip-head-main">
                               <span className="planner-queue-item-kicker">{getQueueSourceLabel(job)}</span>
                               <strong>{formatQueueDateRange(timeRange)}</strong>
                             </div>
-                            <span className={isCompleted ? 'planner-scheme-chip-state planner-scheme-chip-state-complete' : 'planner-scheme-chip-state'}>
-                              {JOB_STATUS_LABELS[job.status] ?? job.status}
-                              {isCompleted ? <Check size={12} /> : null}
-                            </span>
+                            <div className="planner-queue-item-actions">
+                              <span className={isCompleted ? 'planner-scheme-chip-state planner-scheme-chip-state-complete' : 'planner-scheme-chip-state'}>
+                                {JOB_STATUS_LABELS[job.status] ?? job.status}
+                                {isCompleted ? <Check size={12} /> : null}
+                              </span>
+                              <button
+                                className="icon-button planner-queue-delete-button"
+                                type="button"
+                                onClick={(event) => deleteQueueJob(job, event)}
+                                onKeyDown={(event) => event.stopPropagation()}
+                                aria-label={`删除方案 ${formatQueueDateRange(timeRange)}`}
+                                title="删除方案"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
                           </div>
                           <div className="planner-scheme-chip-range">
                             <span>{formatQueueTime(job.updatedAt || job.createdAt)}</span>
                             <span className="planner-scheme-chip-separator">·</span>
                             <span>{getProviderLabel(job.provider)}</span>
                           </div>
-                        </button>
+                          {formatJobProgress(job) && !job.lastError ? (
+                            <p className="planner-queue-item-progress" title={formatJobProgress(job)}>
+                              {formatJobProgress(job)}
+                            </p>
+                          ) : null}
+                          {job.lastError ? (
+                            <p className="planner-queue-item-error" title={job.lastError}>
+                              {job.lastError}
+                            </p>
+                          ) : null}
+                        </div>
                       )
                     })}
                   </div>
@@ -1491,10 +2007,39 @@ export function PlanningWorkbench({
               ))}
             </div>
           ) : (
-            <div className="info-note">暂无历史任务</div>
+            <div className="info-note">暂无历史方案</div>
           )}
         </div>
       </aside>
+      ) : null}
+
+      {activeWorkflowStep === 'review' ? (
+      <section className="panel planner-step-card planner-review-step-card">
+        {typeof renderReviewBoard === 'function' ? (
+          <div className="planner-review-step-board">
+            {renderReviewBoard(() => setActiveWorkflowStep('prepare'))}
+          </div>
+        ) : (
+          <>
+            <div className="planner-step-card-head">
+              <strong>步骤 3</strong>
+              <h2>排程调整与审核</h2>
+              <span>AI 结果导入后，可在这里继续处理冲突、修改日期并完成审核。</span>
+            </div>
+            <div className="planner-ready-card planner-ready-card-ok">
+              <Check size={16} />
+              <div>
+                <strong>{hasSelectedScheme ? '已有可查看的 AI 方案' : '等待 AI 排程结果'}</strong>
+                <span>{hasGeneratedPlan ? '完成 AI 排程并导入后，将进入排程调整与审核。' : '请先完成清单准备，再进入 AI 排程。'}</span>
+              </div>
+            </div>
+          </>
+        )}
+      </section>
+      ) : null}
+        </div>
+
+      </div>
 
       {hasSelectedScheme ? (
         <div className="modal-backdrop modal-open" onClick={() => setSelectedSchemeId('')}>
@@ -1514,6 +2059,16 @@ export function PlanningWorkbench({
             {!selectedSchemeData && selectedSchemeJob ? (
               <div className="info-note">
                 当前任务为 {JOB_STATUS_LABELS[selectedSchemeJob.status] ?? selectedSchemeJob.status}，完成后可查看排程预览和未排程提示。
+              </div>
+            ) : null}
+            {formatJobProgress(selectedSchemeJob) ? (
+              <div className="info-note">
+                运行心跳：{formatJobProgress(selectedSchemeJob)}
+              </div>
+            ) : null}
+            {selectedSchemeJob?.lastError ? (
+              <div className="info-note warning-note-inline">
+                错误原因：{selectedSchemeJob.lastError}
               </div>
             ) : null}
             <div className="planner-scheme-modal-body">
@@ -1803,7 +2358,7 @@ export function PlanningWorkbench({
               <label className="field">
                 <span>自动回填结果</span>
                 <select
-                  value={Boolean(aiSettings.autoImportResult) ? 'yes' : 'no'}
+                  value={aiSettings.autoImportResult ? 'yes' : 'no'}
                   onChange={(event) => updateAiSettings({ autoImportResult: event.target.value === 'yes' })}
                 >
                   <option value="yes">开启</option>
@@ -1813,7 +2368,7 @@ export function PlanningWorkbench({
               <label className="field">
                 <span>自动导入审核</span>
                 <select
-                  value={Boolean(aiSettings.autoImportToReview) ? 'yes' : 'no'}
+                  value={aiSettings.autoImportToReview ? 'yes' : 'no'}
                   onChange={(event) => updateAiSettings({ autoImportToReview: event.target.value === 'yes' })}
                 >
                   <option value="no">关闭</option>
@@ -1830,11 +2385,13 @@ export function PlanningWorkbench({
               </button>
             </div>
             <div className="info-note">
-              {desktopAiAvailable
+              {configState.source === 'browser'
+                ? `${currentProviderOption.label} Key ${currentProviderHasKey ? '已保存在当前浏览器' : '尚未保存'}。网页版会直接从浏览器请求模型接口，请只在可信设备上使用。`
+                : desktopAiAvailable
                 ? `${currentProviderOption.label} Key ${currentProviderHasKey ? '已保存' : '尚未保存'}，当前存储方式：${
                     configState.encryptionMode === 'safeStorage' ? '系统安全存储' : '普通文件'
                   }。`
-                : '当前是纯前端环境，只有通过 Electron 桌面版启动时才可保存 API Key 并执行后台任务。'}
+                : '当前运行环境未初始化 AI 服务，请刷新后重试。'}
             </div>
             {configError ? <p className="error-text">{configError}</p> : null}
           </div>

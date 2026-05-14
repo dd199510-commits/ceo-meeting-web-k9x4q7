@@ -60,12 +60,45 @@ export function normalizeReviewState(input) {
   }
 }
 
+function hydrateAiScheduledMeetings(aiState) {
+  const scheduledMeetings = aiState.scheduledMeetings.scheduledMeetings
+  const taskToInstance = new Map(
+    Array.isArray(aiState.exportBatch?.taskMap)
+      ? aiState.exportBatch.taskMap.map((item) => [item.taskId, item.instanceId])
+      : [],
+  )
+  const inputMeetingMap = new Map(
+    Array.isArray(aiState.inputMeetings?.meetings)
+      ? aiState.inputMeetings.meetings.map((meeting) => [meeting.id, meeting])
+      : [],
+  )
+
+  return scheduledMeetings.map((meeting, index) => {
+    const instanceId = taskToInstance.get(meeting.taskId)
+    const sourceMeeting = instanceId ? inputMeetingMap.get(instanceId) : null
+
+    return {
+      ...sourceMeeting,
+      ...meeting,
+      id: meeting.id ?? sourceMeeting?.id ?? `scheduled-${index + 1}`,
+      taskId: meeting.taskId ?? '',
+      meetingId: sourceMeeting?.meetingId ?? sourceMeeting?.sourceMeetingId ?? meeting.meetingId ?? '',
+      name: sourceMeeting?.name ?? meeting.name ?? `任务 ${meeting.taskId || index + 1}`,
+      attendees: sourceMeeting?.attendees ?? meeting.attendees ?? '',
+      notes: sourceMeeting?.notes ?? meeting.notes ?? '',
+      noteMentions: sourceMeeting?.noteMentions ?? meeting.noteMentions ?? [],
+      sourceFrequency: sourceMeeting?.sourceFrequency ?? meeting.sourceFrequency ?? null,
+      sourceAnchorDate: sourceMeeting?.sourceAnchorDate ?? meeting.sourceAnchorDate ?? '',
+    }
+  })
+}
+
 export function importAiScheduleToReview(aiState) {
   if (!aiState?.scheduledMeetings?.scheduledMeetings) {
     return DEFAULT_REVIEW_STATE
   }
 
-  const hydratedMeetings = aiState.scheduledMeetings.scheduledMeetings.map((meeting) => ({
+  const hydratedMeetings = hydrateAiScheduledMeetings(aiState).map((meeting) => ({
     ...meeting,
     locked: false,
     reserved: false,

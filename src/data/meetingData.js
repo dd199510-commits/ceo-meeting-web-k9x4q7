@@ -2,6 +2,49 @@ export const STORAGE_KEY = 'meeting-manager:optimized-demo:v1'
 export const AI_STORAGE_KEY = 'meeting-manager:ai-scheduler:v1'
 export const REVIEW_STORAGE_KEY = 'meeting-manager:review:v1'
 export const LOG_STORAGE_KEY = 'meeting-manager:logs:v1'
+export const DEFAULT_MEETING_PREFIX = '【常规会议】'
+
+export const INITIAL_CONTACTS = [
+  {
+    id: 'c-robin',
+    name: 'Robin',
+    email: 'robin@example.com',
+    aliases: ['罗宾'],
+    secretaries: [
+      {
+        id: 'sec-robin-1',
+        name: 'Robin 秘书',
+        email: 'robin.assistant@example.com',
+      },
+    ],
+    department: 'CEO Office',
+    title: '',
+    notes: '',
+    status: 'active',
+  },
+  {
+    id: 'c-alice',
+    name: 'Alice',
+    email: 'alice@example.com',
+    aliases: ['Alice Zhang'],
+    secretaries: [],
+    department: '',
+    title: '',
+    notes: '',
+    status: 'active',
+  },
+  {
+    id: 'c-bob',
+    name: 'Bob',
+    email: '',
+    aliases: [],
+    secretaries: [],
+    department: '',
+    title: '',
+    notes: '',
+    status: 'active',
+  },
+]
 
 export const FREQUENCY_LABELS = {
   weekly: '周会',
@@ -56,6 +99,10 @@ export const INITIAL_MEETINGS = [
       anchorDate: '2026-03-05',
     },
     notes: '同步重点事项',
+    attendeeRefs: [],
+    extraInvitees: '',
+    extraInviteeRefs: [],
+    secretaryInviteContactIds: [],
     nextDate: '2026-03-12',
     history: ['2026-03-05'],
     status: 'active',
@@ -74,6 +121,10 @@ export const INITIAL_MEETINGS = [
       anchorDate: '2026-02-20',
     },
     notes: '回顾关键指标与路线图',
+    attendeeRefs: [],
+    extraInvitees: '',
+    extraInviteeRefs: [],
+    secretaryInviteContactIds: [],
     nextDate: '2026-03-20',
     history: ['2026-02-20'],
     status: 'active',
@@ -92,6 +143,10 @@ export const INITIAL_MEETINGS = [
       anchorDate: '2026-01-10',
     },
     notes: '季度复盘与资源决策',
+    attendeeRefs: [],
+    extraInvitees: '',
+    extraInviteeRefs: [],
+    secretaryInviteContactIds: [],
     nextDate: '2026-04-10',
     history: ['2026-01-10'],
     status: 'active',
@@ -137,6 +192,7 @@ export function createEmptyMeeting() {
 
   return {
     id: '',
+    meetingPrefix: DEFAULT_MEETING_PREFIX,
     name: '',
     attendees: '',
     duration: 60,
@@ -149,6 +205,10 @@ export function createEmptyMeeting() {
     },
     notes: '',
     noteMentions: [],
+    attendeeRefs: [],
+    extraInvitees: '',
+    extraInviteeRefs: [],
+    secretaryInviteContactIds: [],
     notificationTemplateKey: '',
     notificationConfig: {},
     nextDate: '',
@@ -230,15 +290,25 @@ export function updateMeetingFrequency(meeting, patch) {
 }
 
 export function normalizeMeeting(meeting) {
+  const baseMeeting = {
+    ...meeting,
+    meetingPrefix: meeting.meetingPrefix ?? DEFAULT_MEETING_PREFIX,
+    attendees: meeting.attendees ?? '',
+    attendeeRefs: Array.isArray(meeting.attendeeRefs) ? meeting.attendeeRefs : [],
+    extraInvitees: meeting.extraInvitees ?? '',
+    extraInviteeRefs: Array.isArray(meeting.extraInviteeRefs) ? meeting.extraInviteeRefs : [],
+    secretaryInviteContactIds: Array.isArray(meeting.secretaryInviteContactIds) ? meeting.secretaryInviteContactIds : [],
+    noteMentions: Array.isArray(meeting.noteMentions) ? meeting.noteMentions : [],
+    notificationTemplateKey: meeting.notificationTemplateKey ?? '',
+    notificationConfig:
+      meeting.notificationConfig && typeof meeting.notificationConfig === 'object'
+        ? meeting.notificationConfig
+        : {},
+  }
+
   if (typeof meeting.frequency !== 'string') {
     return {
-      ...meeting,
-      noteMentions: Array.isArray(meeting.noteMentions) ? meeting.noteMentions : [],
-      notificationTemplateKey: meeting.notificationTemplateKey ?? '',
-      notificationConfig:
-        meeting.notificationConfig && typeof meeting.notificationConfig === 'object'
-          ? meeting.notificationConfig
-          : {},
+      ...baseMeeting,
       frequency: {
         interval: 1,
         monthSpec: 1,
@@ -250,13 +320,7 @@ export function normalizeMeeting(meeting) {
   }
 
   return {
-    ...meeting,
-    noteMentions: Array.isArray(meeting.noteMentions) ? meeting.noteMentions : [],
-    notificationTemplateKey: meeting.notificationTemplateKey ?? '',
-    notificationConfig:
-      meeting.notificationConfig && typeof meeting.notificationConfig === 'object'
-        ? meeting.notificationConfig
-        : {},
+    ...baseMeeting,
     frequency: {
       type: meeting.frequency,
       interval: meeting.interval ?? 1,

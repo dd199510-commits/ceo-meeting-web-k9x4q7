@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ChevronDown, FileText, Trash2 } from 'lucide-react'
 import { getMeetingFrequencyType } from '../../data/meetingData'
 import { calculateNextOccurrence, formatNextDateInfo } from '../../lib/meetingFrequency'
+import { getAttendeeSummary } from '../../lib/contacts'
 import { getCompactFrequencyLabel } from './meetingsUtils'
 
 export function MeetingCard({
@@ -19,9 +20,7 @@ export function MeetingCard({
   const frequencyType = getMeetingFrequencyType(meeting)
   const nextOccurrence = calculateNextOccurrence(meeting)
   const nextDateInfo = formatNextDateInfo(nextOccurrence)
-  const attendeeText = meeting.attendees
-    ? meeting.attendees.split(/\n|,|，/).map((item) => item.trim()).filter(Boolean).join(' / ')
-    : '未指定'
+  const attendeeText = getAttendeeSummary(meeting.attendees, 4)
   const notesText = meeting.notes?.trim() || '暂无备注'
   const attendeesOverflow = attendeeText.length > 54
   const notesOverflow = notesText.length > 80

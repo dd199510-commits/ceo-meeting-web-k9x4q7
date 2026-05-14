@@ -10,8 +10,10 @@ import {
   updateMeetingFrequency,
 } from '../../data/meetingData'
 import { MeetingNotesField } from './MeetingNotesField'
+import { AttendeeResolver } from './AttendeeResolver'
+import { appendAttendeeNames, removeAttendeeNames } from '../../lib/contacts'
 
-export function EditModal({ meeting, meetings = [], open, isClosing = false, onClose, onSave }) {
+export function EditModal({ meeting, meetings = [], contacts = [], open, isClosing = false, onClose, onSave, onAddContact }) {
   const [formData, setFormData] = useState(meeting)
   const [historyInput, setHistoryInput] = useState('')
   const [showHistory, setShowHistory] = useState(false)
@@ -37,6 +39,27 @@ export function EditModal({ meeting, meetings = [], open, isClosing = false, onC
     setHistoryInput('')
   }
 
+  function toggleSecretaryInvite(contactId) {
+    const contact = contacts.find((item) => item.id === contactId)
+    const secretaryNames = (contact?.secretaries ?? []).map((item) => item.name).filter(Boolean)
+    if (secretaryNames.length === 0) return
+
+    setFormData((current) => {
+      const selectedIds = current.secretaryInviteContactIds ?? []
+      const selected = selectedIds.includes(contactId)
+
+      return {
+        ...current,
+        secretaryInviteContactIds: selected
+          ? selectedIds.filter((id) => id !== contactId)
+          : [...selectedIds, contactId],
+        extraInvitees: selected
+          ? removeAttendeeNames(current.extraInvitees, secretaryNames)
+          : appendAttendeeNames(current.extraInvitees, secretaryNames),
+      }
+    })
+  }
+
   if (!meeting || !formData) return null
 
   return (
@@ -49,6 +72,14 @@ export function EditModal({ meeting, meetings = [], open, isClosing = false, onC
           </button>
         </div>
         <div className="form-grid">
+          <label className="field">
+            <span>会议前缀</span>
+            <input
+              value={formData.meetingPrefix ?? ''}
+              onChange={(event) => setFormData({ ...formData, meetingPrefix: event.target.value })}
+              placeholder="可留空"
+            />
+          </label>
           <label className="field field-span-2">
             <span>会议名称</span>
             <input
@@ -261,6 +292,28 @@ export function EditModal({ meeting, meetings = [], open, isClosing = false, onC
                 rows="3"
                 value={formData.attendees}
                 onChange={(event) => setFormData({ ...formData, attendees: event.target.value })}
+              />
+              <AttendeeResolver
+                attendees={formData.attendees}
+                contacts={contacts}
+                onChangeAttendees={(attendees) => setFormData((current) => ({ ...current, attendees }))}
+                onAddContact={onAddContact}
+                secretaryContactIds={formData.secretaryInviteContactIds ?? []}
+                onToggleSecretaries={toggleSecretaryInvite}
+              />
+            </label>
+            <label className="field field-span-2">
+              <span>不参会但需发会邀人员</span>
+              <textarea
+                rows="2"
+                value={formData.extraInvitees}
+                onChange={(event) => setFormData({ ...formData, extraInvitees: event.target.value })}
+              />
+              <AttendeeResolver
+                attendees={formData.extraInvitees}
+                contacts={contacts}
+                onChangeAttendees={(extraInvitees) => setFormData((current) => ({ ...current, extraInvitees }))}
+                onAddContact={onAddContact}
               />
             </label>
             <label className="field field-span-2">

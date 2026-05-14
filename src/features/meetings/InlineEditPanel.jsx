@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { ChevronDown, X } from 'lucide-react'
 import {
   FREQUENCY_LABELS,
@@ -11,8 +11,10 @@ import {
 } from '../../data/meetingData'
 import { calculateNextOccurrence } from '../../lib/meetingFrequency'
 import { MeetingNotesField } from './MeetingNotesField'
+import { AttendeeResolver } from './AttendeeResolver'
+import { appendAttendeeNames, removeAttendeeNames } from '../../lib/contacts'
 
-export function InlineEditPanel({ meeting, meetings = [], onCancel, onSave, embedded = false }) {
+export function InlineEditPanel({ meeting, meetings = [], contacts = [], onCancel, onSave, onAddContact, embedded = false }) {
   const [formData, setFormData] = useState(meeting)
   const [historyInput, setHistoryInput] = useState('')
   const [showHistory, setShowHistory] = useState(false)
@@ -36,21 +38,44 @@ export function InlineEditPanel({ meeting, meetings = [], onCancel, onSave, embe
     setHistoryInput('')
   }
 
+  function toggleSecretaryInvite(contactId) {
+    const contact = contacts.find((item) => item.id === contactId)
+    const secretaryNames = (contact?.secretaries ?? []).map((item) => item.name).filter(Boolean)
+    if (secretaryNames.length === 0) return
+
+    setFormData((current) => {
+      const selectedIds = current.secretaryInviteContactIds ?? []
+      const selected = selectedIds.includes(contactId)
+
+      return {
+        ...current,
+        secretaryInviteContactIds: selected
+          ? selectedIds.filter((id) => id !== contactId)
+          : [...selectedIds, contactId],
+        extraInvitees: selected
+          ? removeAttendeeNames(current.extraInvitees, secretaryNames)
+          : appendAttendeeNames(current.extraInvitees, secretaryNames),
+      }
+    })
+  }
+
   const selectedMonths = Array.isArray(formData.frequency?.monthSpec)
     ? formData.frequency.monthSpec
     : [formData.frequency?.monthSpec || 1]
-
-  useEffect(() => {
-    setFormData(meeting)
-    setHistoryInput('')
-    setShowHistory(false)
-  }, [meeting])
 
   const content = (
     <>
       <div className="inline-edit-rows">
         <div className="inline-edit-layout">
           <div className="inline-edit-column inline-edit-column-main">
+            <label className="field inline-field inline-field-prefix">
+              <span>会议前缀</span>
+              <input
+                value={formData.meetingPrefix ?? ''}
+                onChange={(event) => setFormData({ ...formData, meetingPrefix: event.target.value })}
+                placeholder="可留空"
+              />
+            </label>
             <label className="field inline-field inline-field-name">
               <span>会议名称</span>
               <input
@@ -66,6 +91,28 @@ export function InlineEditPanel({ meeting, meetings = [], onCancel, onSave, embe
                   rows="2"
                   value={formData.attendees}
                   onChange={(event) => setFormData({ ...formData, attendees: event.target.value })}
+                />
+                <AttendeeResolver
+                  attendees={formData.attendees}
+                  contacts={contacts}
+                  onChangeAttendees={(attendees) => setFormData((current) => ({ ...current, attendees }))}
+                  onAddContact={onAddContact}
+                  secretaryContactIds={formData.secretaryInviteContactIds ?? []}
+                  onToggleSecretaries={toggleSecretaryInvite}
+                />
+              </label>
+              <label className="field inline-field">
+                <span>不参会但需发会邀人员</span>
+                <textarea
+                  rows="2"
+                  value={formData.extraInvitees}
+                  onChange={(event) => setFormData({ ...formData, extraInvitees: event.target.value })}
+                />
+                <AttendeeResolver
+                  attendees={formData.extraInvitees}
+                  contacts={contacts}
+                  onChangeAttendees={(extraInvitees) => setFormData((current) => ({ ...current, extraInvitees }))}
+                  onAddContact={onAddContact}
                 />
               </label>
               <label className="field inline-field">

@@ -9,6 +9,7 @@ import {
   Filter,
   GripVertical,
   Link2,
+  Mail,
   MoreHorizontal,
   Pin,
   Plus,
@@ -18,6 +19,7 @@ import {
   X,
 } from 'lucide-react'
 import { FREQUENCY_LABELS, getMeetingFrequencyType } from '../../data/meetingData'
+import { getAttendeeSummary, getResolvedAttendeeStats, splitAttendees } from '../../lib/contacts'
 import { calculateNextOccurrence, formatNextDateInfo } from '../../lib/meetingFrequency'
 import { FilterPanel } from './FilterPanel'
 import { InlineEditPanel } from './InlineEditPanel'
@@ -37,27 +39,13 @@ import {
 } from './meetingsUtils'
 
 function getAttendeeList(meeting) {
-  return meeting.attendees
-    ? meeting.attendees.split(/\n|,|，|、|\/|；|;/).map((item) => item.trim()).filter(Boolean)
-    : []
-}
-
-function getAttendeeSummary(meeting, maxCount = 3) {
-  const attendees = getAttendeeList(meeting)
-  if (attendees.length === 0) return '未指定'
-  const visible = attendees.slice(0, maxCount).join('、')
-  return attendees.length > maxCount ? `${visible} 等 ${attendees.length} 人` : visible
+  return splitAttendees(meeting.attendees)
 }
 
 function getMeetingDateLabel(meeting) {
   const nextOccurrence = calculateNextOccurrence(meeting)
   const nextDateInfo = formatNextDateInfo(nextOccurrence)
   return nextDateInfo.prefix ? `${nextDateInfo.prefix} ${nextDateInfo.date}` : nextDateInfo.date
-}
-
-function getLatestHistory(meeting) {
-  const history = meeting.history ?? []
-  return history.length > 0 ? history[history.length - 1] : '无记录'
 }
 
 export function MeetingsView({
@@ -74,6 +62,8 @@ export function MeetingsView({
   onDeleteMeetingForever,
   onReorderMeetings,
   onSaveMeeting,
+  contacts = [],
+  onAddContact,
   onCreateMeeting,
   onBatchImport,
   onGoToPlanner,
@@ -159,19 +149,6 @@ export function MeetingsView({
     return () => window.removeEventListener('pointerdown', handlePointerDown)
   }, [])
 
-  useEffect(() => {
-    if (inlineEditingId && !meetings.some((meeting) => meeting.id === inlineEditingId)) {
-      setInlineEditingId(null)
-    }
-  }, [inlineEditingId, meetings])
-
-  useEffect(() => {
-    if (selectedMeetingId && displayedMeetings.some((meeting) => meeting.id === selectedMeetingId)) {
-      return
-    }
-    setSelectedMeetingId(displayedMeetings[0]?.id ?? '')
-  }, [displayedMeetings, selectedMeetingId])
-
   const hasCollapsedSections = useMemo(() => {
     const hasCollapsedGroup = Object.entries(groupedMeetings).some(
       ([groupKey, subGroups]) =>
@@ -186,20 +163,6 @@ export function MeetingsView({
 
     return hasCollapsedGroup || hasCollapsedSubGroup
   }, [collapsedGroups, collapsedSubGroups, groupedMeetings])
-
-  function toggleGroup(groupKey) {
-    setCollapsedGroups((current) =>
-      current.includes(groupKey) ? current.filter((key) => key !== groupKey) : [...current, groupKey],
-    )
-  }
-
-  function toggleSubGroup(groupKey, subGroupKey) {
-    const stateKey = `${groupKey}:${subGroupKey}`
-    setCollapsedSubGroups((current) => ({
-      ...current,
-      [stateKey]: current[stateKey] === false,
-    }))
-  }
 
   function moveMeeting(targetId) {
     if (!draggedMeetingId || draggedMeetingId === targetId) return
@@ -334,6 +297,7 @@ export function MeetingsView({
     const frequencyType = getMeetingFrequencyType(meeting)
     const historyCount = meeting.history?.length ?? 0
     const linkedCount = meeting.noteMentions?.length ?? 0
+    const attendeeSummary = getAttendeeSummary(meeting.attendees, 3)
     const isSelected = selectedMeeting?.id === meeting.id
     const isEditing = inlineEditingId === meeting.id
 
@@ -352,7 +316,10 @@ export function MeetingsView({
           isEditing ? 'meetings-density-row-editing' : '',
           draggedMeetingId === meeting.id ? 'meeting-dragging' : '',
         ].filter(Boolean).join(' ')}
-        onClick={() => setSelectedMeetingId(meeting.id)}
+        onClick={() => {
+          setSelectedMeetingId(meeting.id)
+          setInlineEditingId((current) => (current ? meeting.id : current))
+        }}
       >
         <div className="meetings-density-cell meetings-density-cell-name">
           {canDrag ? <GripVertical size={14} className="meetings-density-drag" /> : null}
@@ -376,7 +343,7 @@ export function MeetingsView({
         </div>
         <div className="meetings-density-cell meetings-density-cell-attendees">
           <Users size={14} />
-          <span>{getAttendeeSummary(meeting)}</span>
+          <span>{attendeeSummary}</span>
         </div>
         <div className="meetings-density-cell meetings-density-cell-signals">
           {linkedCount > 0 ? <span><Link2 size={13} />{linkedCount}</span> : <span className="muted">无依赖</span>}
@@ -428,8 +395,10 @@ export function MeetingsView({
             key={editingMeeting.id}
             meeting={editingMeeting}
             meetings={meetings}
+            contacts={contacts}
             embedded
             onCancel={() => setInlineEditingId(null)}
+            onAddContact={onAddContact}
             onSave={(nextMeeting) => {
               onSaveMeeting(nextMeeting)
               setInlineEditingId(null)
@@ -450,6 +419,9 @@ export function MeetingsView({
 
     const frequencyType = getMeetingFrequencyType(selectedMeeting)
     const attendees = getAttendeeList(selectedMeeting)
+    const extraInvitees = splitAttendees(selectedMeeting.extraInvitees)
+    const attendeeStats = getResolvedAttendeeStats(selectedMeeting.attendeeRefs)
+    const extraInviteeStats = getResolvedAttendeeStats(selectedMeeting.extraInviteeRefs)
     const history = [...(selectedMeeting.history ?? [])].slice(-5).reverse()
     const linkedMeetings = (selectedMeeting.noteMentions ?? []).filter(Boolean)
 
@@ -497,8 +469,18 @@ export function MeetingsView({
           <div className="meetings-inspector-section-head">
             <Users size={15} />
             <strong>参会人</strong>
+            {attendeeStats.total > 0 ? <span>{attendeeStats.linked}/{attendeeStats.total} 已关联</span> : null}
           </div>
           <p>{attendees.length > 0 ? attendees.join('、') : '未指定'}</p>
+        </section>
+
+        <section className="meetings-inspector-section">
+          <div className="meetings-inspector-section-head">
+            <Mail size={15} />
+            <strong>不参会但需发会邀</strong>
+            {extraInviteeStats.total > 0 ? <span>{extraInviteeStats.linked}/{extraInviteeStats.total} 已关联</span> : null}
+          </div>
+          <p>{extraInvitees.length > 0 ? extraInvitees.join('、') : '未指定'}</p>
         </section>
 
         <section className="meetings-inspector-section">
@@ -630,21 +612,6 @@ export function MeetingsView({
 
               <div className="meetings-toolbar-meta">
                 <div className="meetings-summary-inline meetings-density-summary" aria-label="会议数量概览">
-                  <button
-                    type="button"
-                    className={
-                      navigatorFilter.type === 'all' && quickFilter === 'all'
-                        ? 'meetings-summary-item meetings-summary-item-active'
-                        : 'meetings-summary-item'
-                    }
-                    onClick={() => {
-                      setQuickFilter('all')
-                      selectNavigatorFilter({ type: 'all', key: 'all' })
-                    }}
-                    aria-pressed={navigatorFilter.type === 'all' && quickFilter === 'all'}
-                  >
-                    全部 {sortedMeetings.length}
-                  </button>
                   {Object.entries(FREQUENCY_LABELS).map(([key, label]) => (
                     <button
                       key={key}
@@ -671,7 +638,7 @@ export function MeetingsView({
                       type="button"
                       className={quickFilter === key ? 'meetings-summary-item meetings-summary-item-active' : 'meetings-summary-item'}
                       onClick={() => {
-                        setQuickFilter(key)
+                        setQuickFilter((current) => (current === key ? 'all' : key))
                         selectNavigatorFilter({ type: 'all', key: 'all' })
                       }}
                       aria-pressed={quickFilter === key}

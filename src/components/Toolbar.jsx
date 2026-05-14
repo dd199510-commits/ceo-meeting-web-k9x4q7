@@ -33,7 +33,7 @@ export function Toolbar({
         <div className="toolbar-brand">
           <div className="toolbar-title-row">
             <h1>CEO Office 会议管理系统</h1>
-            <span className="toolbar-version-badge">2.0</span>
+            <span className="toolbar-version-badge">2.5</span>
             <span className="toolbar-subtitle">{TAB_META[activeTab]?.description}</span>
           </div>
         </div>

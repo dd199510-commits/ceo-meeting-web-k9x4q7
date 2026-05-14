@@ -274,6 +274,7 @@ export function MeetingNotesField({
         ref={textareaRef}
         rows={rows}
         value={value}
+        placeholder={placeholder}
         onChange={handleTextChange}
         onKeyDown={handleKeyDown}
         onClick={(event) => updateMenu(event.target)}

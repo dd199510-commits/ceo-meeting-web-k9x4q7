@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { CheckCircle2, Copy, FilePlus2, PencilLine, Search, Trash2, X } from 'lucide-react'
 import { FREQUENCY_LABELS } from '../../data/meetingData'
+import { splitAttendees } from '../../lib/contacts'
 import {
   BUILT_IN_NOTICE_TEMPLATE_KEYS,
   BUILT_IN_NOTICE_TEMPLATES,
@@ -69,12 +70,16 @@ function extractExecutiveName(meeting, scheduledMeeting) {
     return meeting.notificationConfig.executiveName
   }
 
-  const attendees = String(meeting?.attendees || scheduledMeeting.attendees || '')
-    .split(/[\n、,，]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
+  const meetingName = String(meeting?.name || scheduledMeeting.name || '')
+  const oneOnOneMatch = meetingName.match(/1\s*-\s*1\s*w\s*(.+)$/i)
+  if (oneOnOneMatch?.[1]) {
+    return oneOnOneMatch[1].trim()
+  }
 
-  return attendees[0] ?? meeting?.name ?? scheduledMeeting.name
+  const attendees = splitAttendees(meeting?.attendees || scheduledMeeting.attendees || '')
+  const nonRobin = attendees.find((item) => !/^robin$/i.test(item))
+
+  return nonRobin ?? attendees[0] ?? meeting?.name ?? scheduledMeeting.name
 }
 
 function extractSecretaryName(meeting) {
@@ -130,10 +135,12 @@ function copyText(text) {
 
 export function ReserveNoticeBoard({
   meetings = [],
-  scheduledMeetings = [],
+  schemeOptions = [],
+  noticeTaskOptions = [],
+  selectedTaskId = '',
+  onTaskChange,
   noticeTemplates = [],
   disabledNoticeTemplateKeys = [],
-  reserveNoticeStatus = {},
   onToggleSent,
   onUpdateMeeting,
   onSaveTemplates,
@@ -143,6 +150,21 @@ export function ReserveNoticeBoard({
   const [searchText, setSearchText] = useState('')
   const [showTemplateManager, setShowTemplateManager] = useState(false)
   const [draftNoticeSettings, setDraftNoticeSettings] = useState(null)
+  const [selectedSchemeId, setSelectedSchemeId] = useState('')
+  const selectedTask =
+    noticeTaskOptions.find((task) => task.id === selectedTaskId) ?? noticeTaskOptions[0] ?? null
+  const activeSchemeId = schemeOptions.some((scheme) => scheme.id === selectedSchemeId)
+    ? selectedSchemeId
+    : schemeOptions[0]?.id ?? ''
+  const selectedScheme = schemeOptions.find((scheme) => scheme.id === activeSchemeId) ?? null
+  const scheduledMeetings = useMemo(
+    () => selectedScheme?.scheduledMeetings ?? [],
+    [selectedScheme],
+  )
+  const reserveNoticeStatus = useMemo(
+    () => selectedScheme?.reserveNoticeStatus ?? {},
+    [selectedScheme],
+  )
   const meetingMap = useMemo(() => new Map(meetings.map((meeting) => [meeting.id, meeting])), [meetings])
   const mergedTemplates = useMemo(
     () => getMergedNoticeTemplates(noticeTemplates, disabledNoticeTemplateKeys),
@@ -213,18 +235,21 @@ export function ReserveNoticeBoard({
     null
   const selectedDraft =
     selectedRow?.meeting && draftNoticeSettings?.rowId === selectedRow.id ? draftNoticeSettings : null
-  const selectedPreviewMeeting =
-    selectedRow?.meeting
-      ? {
-          ...selectedRow.meeting,
-          notificationTemplateKey: selectedDraft?.templateKey ?? selectedRow.meeting.notificationTemplateKey ?? '',
-          notificationConfig: {
-            ...(selectedRow.meeting.notificationConfig ?? {}),
-            executiveName: selectedDraft?.executiveName ?? selectedRow.meeting.notificationConfig?.executiveName ?? '',
-            secretaryName: selectedDraft?.secretaryName ?? selectedRow.meeting.notificationConfig?.secretaryName ?? '',
-          },
-        }
-      : selectedRow?.meeting ?? null
+  const selectedPreviewMeeting = useMemo(
+    () =>
+      selectedRow?.meeting
+        ? {
+            ...selectedRow.meeting,
+            notificationTemplateKey: selectedDraft?.templateKey ?? selectedRow.meeting.notificationTemplateKey ?? '',
+            notificationConfig: {
+              ...(selectedRow.meeting.notificationConfig ?? {}),
+              executiveName: selectedDraft?.executiveName ?? selectedRow.meeting.notificationConfig?.executiveName ?? '',
+              secretaryName: selectedDraft?.secretaryName ?? selectedRow.meeting.notificationConfig?.secretaryName ?? '',
+            },
+          }
+        : selectedRow?.meeting ?? null,
+    [selectedDraft, selectedRow],
+  )
   const selectedPreviewTemplateKey = selectedRow
     ? resolveTemplateKey(selectedPreviewMeeting, selectedRow.scheduledMeeting, mergedTemplates)
     : ''
@@ -270,9 +295,54 @@ export function ReserveNoticeBoard({
     ? summarizeText(selectedRow.meeting?.notes || selectedRow.scheduledMeeting.notes, '无备注')
     : '无备注'
 
+  function handleTaskChange(taskId) {
+    setSelectedId('')
+    setSelectedSchemeId('')
+    onTaskChange?.(taskId)
+  }
+
+  function handleSchemeChange(schemeId) {
+    setSelectedId('')
+    setSelectedSchemeId(schemeId)
+  }
+
   return (
     <section className="panel reserve-notice-shell">
       <div className="reserve-notice-topbar">
+        <div className="reserve-task-selector">
+          <div>
+            <span>通知任务来源</span>
+            <strong>{selectedTask?.name ?? '请选择已排程任务'}</strong>
+          </div>
+          <select
+            value={selectedTask?.id ?? ''}
+            onChange={(event) => handleTaskChange(event.target.value)}
+            disabled={noticeTaskOptions.length === 0}
+          >
+            {(noticeTaskOptions.length > 0 ? noticeTaskOptions : [{ id: 'empty', name: '暂无已排程任务' }]).map((task) => (
+              <option key={task.id} value={task.id}>
+                {task.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="reserve-task-selector reserve-scheme-selector">
+          <div>
+            <span>排程方案</span>
+            <strong>{selectedScheme?.label ?? '请选择排程方案'}</strong>
+          </div>
+          <select
+            value={activeSchemeId}
+            onChange={(event) => handleSchemeChange(event.target.value)}
+            disabled={schemeOptions.length === 0}
+          >
+            {(schemeOptions.length > 0 ? schemeOptions : [{ id: 'empty', label: '暂无排程方案' }]).map((scheme) => (
+              <option key={scheme.id} value={scheme.id}>
+                {scheme.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="reserve-notice-progress">
           <CheckCircle2 size={15} />
           <strong>{sentCount}</strong>
@@ -289,8 +359,8 @@ export function ReserveNoticeBoard({
             <strong>{sentCount}</strong>
           </div>
           <div className="reserve-notice-summary-card">
-            <span>通知任务</span>
-            <strong>{rows.length}</strong>
+            <span>排程状态</span>
+            <strong>{selectedTask?.status ?? '待选择'}</strong>
           </div>
         </div>
       </div>
@@ -354,7 +424,7 @@ export function ReserveNoticeBoard({
                     <input
                       type="checkbox"
                       checked={row.sent}
-                      onChange={() => onToggleSent(row.id)}
+                      onChange={() => onToggleSent(row.id, selectedScheme)}
                     />
                     <span>{row.sent ? '已发送' : '未发送'}</span>
                   </label>
@@ -401,7 +471,7 @@ export function ReserveNoticeBoard({
                     <PencilLine size={16} />
                     管理模板
                   </button>
-                  <button className="ghost-button" onClick={() => onToggleSent(selectedRow.id)}>
+                  <button className="ghost-button" onClick={() => onToggleSent(selectedRow.id, selectedScheme)}>
                     <CheckCircle2 size={16} />
                     {selectedRow.sent ? '取消已发送' : '标记已发送'}
                   </button>

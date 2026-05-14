@@ -50,6 +50,11 @@ class JobStore {
     return this.listJobs().find((job) => job.id === jobId) ?? null
   }
 
+  getRawJob(jobId) {
+    const data = this.readAll()
+    return (Array.isArray(data.jobs) ? data.jobs : []).find((job) => job.id === jobId) ?? null
+  }
+
   upsertJob(nextJob) {
     const data = this.readAll()
     const jobs = Array.isArray(data.jobs) ? data.jobs : []

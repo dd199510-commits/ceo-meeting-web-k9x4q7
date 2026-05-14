@@ -6,7 +6,7 @@ const { GeminiClient, normalizeProviderError } = require('./gemini-client.cjs')
 const { DeepSeekClient, normalizeDeepSeekError } = require('./deepseek-client.cjs')
 
 const ACTIVE_STATUSES = new Set(['queued', 'submitting', 'submitted', 'polling', 'in_progress', 'retry_wait'])
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'expired'])
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'expired', 'deleted'])
 
 const MEETING_SCHEDULE_SCHEMA = {
   type: 'object',
@@ -55,6 +55,29 @@ const MEETING_SCHEDULE_SCHEMA = {
   },
 }
 
+const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi
+
+function redactSensitiveForExternalModel(value) {
+  return String(value || '').replace(EMAIL_PATTERN, '[已脱敏邮箱]')
+}
+
+function redactSensitivePayload(value) {
+  if (typeof value === 'string') {
+    return redactSensitiveForExternalModel(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactSensitivePayload)
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !['contacts', 'attendeeRefs', 'extraInviteeRefs'].includes(key))
+        .map(([key, item]) => [key, redactSensitivePayload(item)]),
+    )
+  }
+  return value
+}
+
 function toIsoNow() {
   return new Date().toISOString()
 }
@@ -73,6 +96,7 @@ function sanitizeJob(job) {
   return {
     id: job.id,
     batchId: job.batchId,
+    planningTaskId: job.planningTaskId ?? job.requestSnapshot?.planningTaskId ?? '',
     provider: job.provider ?? 'openai',
     model: job.model,
     status: job.status,
@@ -86,6 +110,7 @@ function sanitizeJob(job) {
     resultSummary: job.result?.summary ?? null,
     inputMeetings: job.requestSnapshot?.inputMeetings ?? null,
     exportBatch: job.requestSnapshot?.exportBatch ?? null,
+    progress: job.progress ?? null,
   }
 }
 
@@ -128,6 +153,40 @@ function extractDeepSeekResponseText(response) {
   return response?.choices?.[0]?.message?.content?.trim() || ''
 }
 
+function createProgressSnapshot(message, patch = {}) {
+  const now = toIsoNow()
+  return {
+    phase: patch.phase ?? 'running',
+    lastMessage: message,
+    lastActivityAt: now,
+    chunkCount: Number(patch.chunkCount ?? 0),
+    contentChunkCount: Number(patch.contentChunkCount ?? 0),
+    reasoningChunkCount: Number(patch.reasoningChunkCount ?? 0),
+    byteCount: Number(patch.byteCount ?? 0),
+    events: [{ at: now, message }],
+  }
+}
+
+function appendProgressEvent(progress, message, patch = {}) {
+  const now = toIsoNow()
+  const previous = progress ?? createProgressSnapshot(message)
+  const events = Array.isArray(previous.events) ? previous.events : []
+
+  return {
+    ...previous,
+    ...patch,
+    lastMessage: message,
+    lastActivityAt: now,
+    events: [
+      ...events.slice(-7),
+      {
+        at: now,
+        message,
+      },
+    ],
+  }
+}
+
 function createAiJobService(app, configStore) {
   const store = new JobStore(app)
   const timers = new Map()
@@ -151,12 +210,61 @@ function createAiJobService(app, configStore) {
   }
 
   function persistJob(job) {
+    const currentJob = store.getRawJob(job.id)
+    if (currentJob?.status === 'deleted') {
+      return currentJob
+    }
+
     const nextJob = {
       ...job,
       updatedAt: toIsoNow(),
     }
     store.upsertJob(nextJob)
     return nextJob
+  }
+
+  function createJobProgressReporter(jobId, providerLabel) {
+    let chunkCount = 0
+    let contentChunkCount = 0
+    let reasoningChunkCount = 0
+    let byteCount = 0
+    let lastPersistedAt = 0
+
+    return (chunk = {}) => {
+      const text = String(chunk.text || '')
+      chunkCount += 1
+      byteCount += Buffer.byteLength(text, 'utf8')
+      if (chunk.kind === 'reasoning') {
+        reasoningChunkCount += 1
+      } else {
+        contentChunkCount += 1
+      }
+
+      const now = Date.now()
+      if (now - lastPersistedAt < 1500 && chunkCount % 12 !== 0) {
+        return
+      }
+
+      lastPersistedAt = now
+      const currentJob = store.getJob(jobId)
+      if (!currentJob || TERMINAL_STATUSES.has(currentJob.status)) return
+
+      const message =
+        chunk.kind === 'reasoning'
+          ? `${providerLabel} 正在推理，已收到 ${reasoningChunkCount} 个推理片段。`
+          : `${providerLabel} 正在生成结果，已收到 ${contentChunkCount} 个结果片段。`
+
+      persistJob({
+        ...currentJob,
+        progress: appendProgressEvent(currentJob.progress, message, {
+          phase: chunk.kind === 'reasoning' ? 'reasoning_streaming' : 'content_streaming',
+          chunkCount,
+          contentChunkCount,
+          reasoningChunkCount,
+          byteCount,
+        }),
+      })
+    }
   }
 
   function schedulePoll(jobId, delayMs) {
@@ -175,9 +283,13 @@ function createAiJobService(app, configStore) {
   async function submitJob(payload) {
     const createdAt = toIsoNow()
     const provider = payload.provider === 'gemini' ? 'gemini' : payload.provider === 'deepseek' ? 'deepseek' : 'openai'
+    const safePrompt = redactSensitiveForExternalModel(payload.prompt)
+    const safeInputMeetings = redactSensitivePayload(payload.inputMeetings)
+    const safePreferences = redactSensitivePayload(payload.preferences)
     const draftJob = persistJob({
       id: createJobId(),
       batchId: payload.batchId,
+      planningTaskId: payload.planningTaskId || '',
       provider,
       model:
         payload.model ||
@@ -192,13 +304,15 @@ function createAiJobService(app, configStore) {
       attemptCount: 1,
       promptVersion: payload.promptVersion || 'v1',
       requestSnapshot: {
-        prompt: payload.prompt,
-        inputMeetings: payload.inputMeetings,
-        preferences: payload.preferences,
+        prompt: safePrompt,
+        inputMeetings: safeInputMeetings,
+        preferences: safePreferences,
         exportBatch: payload.exportBatch,
+        planningTaskId: payload.planningTaskId || '',
       },
       responseId: '',
       lastError: '',
+      progress: createProgressSnapshot('已写入本地方案队列，准备提交模型。', { phase: 'queued' }),
       result: null,
     })
 
@@ -208,6 +322,7 @@ function createAiJobService(app, configStore) {
           ...draftJob,
           status: 'in_progress',
           responseId: `gemini-local-${draftJob.id}`,
+          progress: appendProgressEvent(draftJob.progress, 'Gemini 请求已发出，等待流式响应。', { phase: 'request_sent' }),
         })
 
         processGeminiJob(submittedJob.id).catch(() => {})
@@ -219,6 +334,7 @@ function createAiJobService(app, configStore) {
           ...draftJob,
           status: 'in_progress',
           responseId: `deepseek-local-${draftJob.id}`,
+          progress: appendProgressEvent(draftJob.progress, 'DeepSeek 请求已发出，等待流式响应。', { phase: 'request_sent' }),
         })
 
         processDeepSeekJob(submittedJob.id).catch(() => {})
@@ -275,11 +391,38 @@ function createAiJobService(app, configStore) {
     }
 
     try {
-      const response = await getClient('gemini').generateStructuredContent({
-        model: currentJob.model,
-        prompt: currentJob.requestSnapshot.prompt,
-        schema: MEETING_SCHEDULE_SCHEMA,
+      persistJob({
+        ...currentJob,
+        progress: appendProgressEvent(currentJob.progress, 'Gemini 已开始处理请求。', { phase: 'started' }),
       })
+
+      const geminiClient = getClient('gemini')
+      let response
+
+      try {
+        response = await geminiClient.streamStructuredContent({
+          model: currentJob.model,
+          prompt: currentJob.requestSnapshot.prompt,
+          schema: MEETING_SCHEDULE_SCHEMA,
+          onChunk: createJobProgressReporter(jobId, 'Gemini'),
+        })
+      } catch (streamError) {
+        if (![400, 404].includes(streamError?.status)) {
+          throw streamError
+        }
+        const latestJob = store.getJob(jobId) ?? currentJob
+        persistJob({
+          ...latestJob,
+          progress: appendProgressEvent(latestJob.progress, 'Gemini 流式响应不可用，已切换为普通等待模式。', {
+            phase: 'non_streaming_fallback',
+          }),
+        })
+        response = await geminiClient.generateStructuredContent({
+          model: currentJob.model,
+          prompt: currentJob.requestSnapshot.prompt,
+          schema: MEETING_SCHEDULE_SCHEMA,
+        })
+      }
 
       const responseText =
         response.candidates?.[0]?.content?.parts
@@ -287,21 +430,38 @@ function createAiJobService(app, configStore) {
           .join('\n')
           .trim() || ''
 
+      if (!responseText) {
+        const candidate = response.candidates?.[0] ?? null
+        const finishReason = candidate?.finishReason ? `finishReason=${candidate.finishReason}` : ''
+        const promptFeedback = response.promptFeedback
+          ? `promptFeedback=${JSON.stringify(response.promptFeedback)}`
+          : ''
+        throw new Error(
+          ['Gemini 未返回可解析的文本内容。', finishReason, promptFeedback]
+            .filter(Boolean)
+            .join(' '),
+        )
+      }
+
       const parsedResult = JSON.parse(responseText)
+      const latestJob = store.getJob(jobId) ?? currentJob
       const completedJob = persistJob({
-        ...currentJob,
+        ...latestJob,
         status: 'completed',
         responseStatus: 'completed',
         rawResponse: response,
         resultText: responseText,
         result: parsedResult,
+        progress: appendProgressEvent(latestJob.progress, 'Gemini 已返回完整结果，解析完成。', { phase: 'completed' }),
       })
       return sanitizeJob(completedJob)
     } catch (error) {
+      const latestJob = store.getJob(jobId) ?? currentJob
       const failedJob = persistJob({
-        ...currentJob,
+        ...latestJob,
         status: 'failed',
         lastError: normalizeProviderError(error),
+        progress: appendProgressEvent(latestJob.progress, `Gemini 失败：${normalizeProviderError(error)}`, { phase: 'failed' }),
       })
       return sanitizeJob(failedJob)
     }
@@ -314,27 +474,57 @@ function createAiJobService(app, configStore) {
     }
 
     try {
-      const response = await getClient('deepseek').createJsonCompletion({
-        model: currentJob.model,
-        prompt: currentJob.requestSnapshot.prompt,
+      persistJob({
+        ...currentJob,
+        progress: appendProgressEvent(currentJob.progress, 'DeepSeek 已开始处理请求。', { phase: 'started' }),
       })
+
+      const deepSeekClient = getClient('deepseek')
+      let response
+
+      try {
+        response = await deepSeekClient.createJsonCompletionStream({
+          model: currentJob.model,
+          prompt: currentJob.requestSnapshot.prompt,
+          onChunk: createJobProgressReporter(jobId, 'DeepSeek'),
+        })
+      } catch (streamError) {
+        if (![400, 404].includes(streamError?.status)) {
+          throw streamError
+        }
+        const latestJob = store.getJob(jobId) ?? currentJob
+        persistJob({
+          ...latestJob,
+          progress: appendProgressEvent(latestJob.progress, 'DeepSeek 流式响应不可用，已切换为普通等待模式。', {
+            phase: 'non_streaming_fallback',
+          }),
+        })
+        response = await deepSeekClient.createJsonCompletion({
+          model: currentJob.model,
+          prompt: currentJob.requestSnapshot.prompt,
+        })
+      }
 
       const responseText = extractDeepSeekResponseText(response)
       const parsedResult = JSON.parse(responseText)
+      const latestJob = store.getJob(jobId) ?? currentJob
       const completedJob = persistJob({
-        ...currentJob,
+        ...latestJob,
         status: 'completed',
         responseStatus: 'completed',
         rawResponse: response,
         resultText: responseText,
         result: parsedResult,
+        progress: appendProgressEvent(latestJob.progress, 'DeepSeek 已返回完整结果，解析完成。', { phase: 'completed' }),
       })
       return sanitizeJob(completedJob)
     } catch (error) {
+      const latestJob = store.getJob(jobId) ?? currentJob
       const failedJob = persistJob({
-        ...currentJob,
+        ...latestJob,
         status: 'failed',
         lastError: normalizeDeepSeekError(error),
+        progress: appendProgressEvent(latestJob.progress, `DeepSeek 失败：${normalizeDeepSeekError(error)}`, { phase: 'failed' }),
       })
       return sanitizeJob(failedJob)
     }
@@ -422,6 +612,7 @@ function createAiJobService(app, configStore) {
       attemptCount: (currentJob.attemptCount ?? 0) + 1,
       lastError: '',
       responseId: '',
+      progress: appendProgressEvent(currentJob.progress, '准备重试模型请求。', { phase: 'retrying' }),
       result: null,
       resultText: '',
       rawResponse: null,
@@ -433,6 +624,7 @@ function createAiJobService(app, configStore) {
           ...retryingJob,
           status: 'in_progress',
           responseId: `gemini-local-${retryingJob.id}-${retryingJob.attemptCount}`,
+          progress: appendProgressEvent(retryingJob.progress, 'Gemini 重试请求已发出，等待流式响应。', { phase: 'request_sent' }),
         })
         processGeminiJob(submittedJob.id).catch(() => {})
         return sanitizeJob(submittedJob)
@@ -443,6 +635,7 @@ function createAiJobService(app, configStore) {
           ...retryingJob,
           status: 'in_progress',
           responseId: `deepseek-local-${retryingJob.id}-${retryingJob.attemptCount}`,
+          progress: appendProgressEvent(retryingJob.progress, 'DeepSeek 重试请求已发出，等待流式响应。', { phase: 'request_sent' }),
         })
         processDeepSeekJob(submittedJob.id).catch(() => {})
         return sanitizeJob(submittedJob)
@@ -452,7 +645,7 @@ function createAiJobService(app, configStore) {
         model: retryingJob.model,
         background: true,
         store: true,
-        input: retryingJob.requestSnapshot.prompt,
+        input: redactSensitiveForExternalModel(retryingJob.requestSnapshot.prompt),
         text: {
           format: {
             type: 'json_schema',
@@ -492,11 +685,33 @@ function createAiJobService(app, configStore) {
   }
 
   function listJobs() {
-    return store.listJobs().map(sanitizeJob)
+    return store.listJobs().filter((job) => job.status !== 'deleted').map(sanitizeJob)
   }
 
   function getJob(jobId) {
-    return sanitizeJob(store.getJob(jobId))
+    const job = store.getJob(jobId)
+    return job?.status === 'deleted' ? null : sanitizeJob(job)
+  }
+
+  function deleteJob(jobId) {
+    const currentJob = store.getJob(jobId)
+    if (!currentJob) {
+      return { deleted: false }
+    }
+
+    if (timers.has(jobId)) {
+      clearTimeout(timers.get(jobId))
+      timers.delete(jobId)
+    }
+
+    persistJob({
+      ...currentJob,
+      status: 'deleted',
+      lastError: '',
+      progress: appendProgressEvent(currentJob.progress, '方案已从本地队列删除。', { phase: 'deleted' }),
+    })
+
+    return { deleted: true }
   }
 
   function registerImportedJob(payload = {}) {
@@ -512,6 +727,7 @@ function createAiJobService(app, configStore) {
     const nextJob = persistJob({
       id: payload.id || createImportedJobId(),
       batchId: payload.batchId || `imported-batch-${Date.now()}`,
+      planningTaskId: payload.planningTaskId || '',
       provider,
       model: payload.model || '导入方案',
       status: 'completed',
@@ -524,6 +740,7 @@ function createAiJobService(app, configStore) {
         inputMeetings: payload.inputMeetings ?? null,
         preferences: payload.preferences ?? null,
         exportBatch: payload.exportBatch ?? null,
+        planningTaskId: payload.planningTaskId || '',
       },
       responseId: `imported-local-${Date.now()}`,
       responseStatus: 'completed',
@@ -553,6 +770,7 @@ function createAiJobService(app, configStore) {
     ipcMain.handle('ai-jobs:get', async (_, jobId) => getJob(jobId))
     ipcMain.handle('ai-jobs:submit', async (_, payload) => submitJob(payload))
     ipcMain.handle('ai-jobs:retry', async (_, jobId) => retryJob(jobId))
+    ipcMain.handle('ai-jobs:delete', async (_, jobId) => deleteJob(jobId))
     ipcMain.handle('ai-jobs:register-imported', async (_, payload) => registerImportedJob(payload))
   }
 

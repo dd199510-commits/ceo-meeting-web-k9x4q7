@@ -34,25 +34,6 @@ function formatSourceFrequency(sourceFrequency) {
   return '频率：不定期'
 }
 
-function renderReviewNote(note) {
-  return (
-    <div key={note.id} className="conflict-note">
-      <strong>{note.title}</strong>
-      {note.body ? <p>{note.body}</p> : null}
-      {Array.isArray(note.items) && note.items.length > 0 ? (
-        <div className="review-note-list">
-          {note.items.map((item, index) => (
-            <div key={`${note.id}-${item.name}-${index}`} className="review-note-item">
-              <strong className="review-note-item-name">{item.name}</strong>
-              <span className="review-note-item-reason">{item.reason}</span>
-            </div>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
 function getDefaultManualMeeting() {
   const today = formatDate(new Date())
   return {
@@ -77,6 +58,14 @@ function getDefaultManualMeeting() {
     reserved: false,
     manuallyAdded: true,
   }
+}
+
+function getWeekdayName(dateString) {
+  const [year, month, day] = String(dateString || '').split('-').map(Number)
+  if (!year || !month || !day) return ''
+  return ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'][
+    new Date(year, month - 1, day).getDay()
+  ]
 }
 
 function getDefaultLinkedDraft(defaultDate) {
@@ -157,12 +146,6 @@ function describeMissingOccurrence(meeting, dateString) {
   }
 
   return `原定 ${formatShortDate(dateString)} 未排上`
-}
-
-function formatMissingOccurrenceSummary(meeting, missingDates) {
-  if (!Array.isArray(missingDates) || missingDates.length === 0) return ''
-
-  return missingDates.map((date) => describeMissingOccurrence(meeting, date)).join('；')
 }
 
 function buildChecklistNoteLines(row) {
@@ -290,8 +273,6 @@ export function ReviewBoard({
   scheduledMeetings,
   reviewState = null,
   conflicts,
-  aiConflicts = [],
-  aiSummary = null,
   onToggleLocked,
   onToggleReserved,
   onDeleteMeeting,
@@ -319,7 +300,6 @@ export function ReviewBoard({
   const [selectedDay, setSelectedDay] = useState(null)
   const [selectedMeeting, setSelectedMeeting] = useState(null)
   const [detailEdits, setDetailEdits] = useState({})
-  const [hoveredMeetingId, setHoveredMeetingId] = useState(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const [addMode, setAddMode] = useState('adhoc')
   const [newMeeting, setNewMeeting] = useState(getDefaultManualMeeting())
@@ -541,59 +521,6 @@ export function ReviewBoard({
     return () => window.cancelAnimationFrame(frameId)
   }, [monthAnchor, pendingScrollTarget, viewType, weekAnchor])
 
-  const reviewNotes = useMemo(() => {
-    const notes = []
-
-    if (aiSummary?.unscheduledMeetings) {
-      const unscheduledDetails = Array.isArray(aiSummary.unscheduledMeetingDetails)
-        ? aiSummary.unscheduledMeetingDetails.filter(Boolean)
-        : []
-      notes.push({
-        id: 'unscheduled-summary',
-        title: '未全部排入审核区',
-        body:
-          unscheduledDetails.length > 0
-            ? null
-            : `AI 结果显示仍有 ${aiSummary.unscheduledMeetings} 个会议未成功排程。`,
-        items: unscheduledDetails.map((meeting) => ({
-          name: meeting.name,
-          reason: meeting.reason || '无',
-        })),
-      })
-    }
-
-    aiConflicts.forEach((item, index) => {
-      const affectedNames = Array.isArray(item.affectedMeetingNames) ? item.affectedMeetingNames : []
-      notes.push({
-        id: `ai-conflict-${index}`,
-        title: item.type ? `AI 提醒 · ${item.type}` : 'AI 提醒',
-        body:
-          item.description ||
-          (affectedNames.length > 0
-            ? `涉及会议：${affectedNames.join('、')}`
-            : 'AI 返回了需要人工确认的排程提醒。'),
-      })
-    })
-
-    conflicts.forEach((item) => {
-      notes.push({
-        id: `local-conflict-${item.id}`,
-        title: '当前排程存在时间冲突',
-        body: `${item.date}：${item.description}`,
-      })
-    })
-
-    if (notes.length === 0) {
-      notes.push({
-        id: 'default-note',
-        title: '当前无额外提醒',
-        body: '当前审核区没有检测到新的冲突或 AI 备注，可以继续人工微调并确认排程。',
-      })
-    }
-
-    return notes
-  }, [aiConflicts, aiSummary, conflicts])
-
   const weekRangeLabel = `${weekDays[0]?.date ?? ''} 至 ${weekDays[weekDays.length - 1]?.date ?? ''}`
   const statItems = [
     { key: 'total', label: '总数', value: stats.total, tone: 'blue' },
@@ -709,10 +636,6 @@ export function ReviewBoard({
       if (meeting.id === meetingId || meeting.date !== date) return false
       return meeting.startTime < endTime && startTime < meeting.endTime
     })
-  }
-
-  function hoveredMeeting() {
-    return scheduledMeetings.find((meeting) => meeting.id === hoveredMeetingId) ?? null
   }
 
   function startDraggingMeeting(item) {
@@ -878,10 +801,7 @@ export function ReviewBoard({
             startY: event.clientY,
             dragStarted: false,
           }
-          setHoveredMeetingId(null)
         }}
-        onMouseEnter={() => setHoveredMeetingId(item.id)}
-        onMouseLeave={() => setHoveredMeetingId(null)}
       >
         <div className="review-card-main">
           {item.reserved ? <span className="review-card-corner review-card-corner-reserved" aria-hidden="true" /> : null}
@@ -1313,10 +1233,10 @@ export function ReviewBoard({
                           data-review-day-head={day.date}
                           onClick={() => setSelectedDay({ date: day.date, meetings: items })}
                         >
-                          <div className="review-day-head-main">
-                            <strong>{day.day}</strong>
-                            <span>{day.date}</span>
-                          </div>
+	                          <div className="review-day-head-main">
+	                            <strong>{getWeekdayName(day.date)}</strong>
+	                            <span>{day.date}</span>
+	                          </div>
                           {focusedChecklistMissingDates.has(day.date) || isMissingDate || focusedChecklistActualDates.has(day.date) ? (
                             <div className="review-day-flags">
                               {focusedChecklistMissingDates.has(day.date) ? (
@@ -1482,40 +1402,42 @@ export function ReviewBoard({
   return (
     <div className="review-layout review-layout-integrated">
       {renderChecklistPanel()}
-      <section className="panel">
+      <section className="panel review-list-panel">
         {renderReviewToolbar()}
-        {[...meetingsByDate.entries()].map(([date, items]) => (
-          <div key={date} className="day-block">
-            <div className="day-head">
-              <strong>{date}</strong>
-              <span>{items.length} 个会议</span>
-            </div>
-            <div className="schedule-list">
-              {items.map((item) => (
-                <div key={item.id} className={conflictIdSet.has(item.id) ? 'schedule-item conflict' : 'schedule-item'}>
-                  <div>
-                    <strong>{item.name}</strong>
-                    <p>{item.startTime} - {item.endTime}</p>
-                    {item.sourceFrequency ? <p>{formatSourceFrequency(item.sourceFrequency)}</p> : null}
-                    {item.aiReason ? <p>{getReadableAiReason(item.aiReason)}</p> : null}
+        <div className="review-list-scroll">
+          {[...meetingsByDate.entries()].map(([date, items]) => (
+            <div key={date} className="day-block">
+              <div className="day-head">
+                <strong>{date}</strong>
+                <span>{items.length} 个会议</span>
+              </div>
+              <div className="schedule-list">
+                {items.map((item) => (
+                  <div key={item.id} className={conflictIdSet.has(item.id) ? 'schedule-item conflict' : 'schedule-item'}>
+                    <div>
+                      <strong>{item.name}</strong>
+                      <p>{item.startTime} - {item.endTime}</p>
+                      {item.sourceFrequency ? <p>{formatSourceFrequency(item.sourceFrequency)}</p> : null}
+                      {item.aiReason ? <p>{getReadableAiReason(item.aiReason)}</p> : null}
+                    </div>
+                    <div className="review-actions">
+                      <span className={FREQUENCY_COLORS[item.frequency]}>{FREQUENCY_LABELS[item.frequency]}</span>
+                      <button className="icon-button" onClick={() => onToggleReserved(item.id)}>
+                        <Pin size={14} className={item.reserved ? 'icon-active-orange' : ''} />
+                      </button>
+                      <button className="icon-button" onClick={() => onToggleLocked(item.id)}>
+                        <Lock size={14} className={item.locked ? 'icon-active-green' : ''} />
+                      </button>
+                      <button className="icon-button danger" onClick={() => onDeleteMeeting(item.id)}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </div>
-                  <div className="review-actions">
-                    <span className={FREQUENCY_COLORS[item.frequency]}>{FREQUENCY_LABELS[item.frequency]}</span>
-                    <button className="icon-button" onClick={() => onToggleReserved(item.id)}>
-                      <Pin size={14} className={item.reserved ? 'icon-active-orange' : ''} />
-                    </button>
-                    <button className="icon-button" onClick={() => onToggleLocked(item.id)}>
-                      <Lock size={14} className={item.locked ? 'icon-active-green' : ''} />
-                    </button>
-                    <button className="icon-button danger" onClick={() => onDeleteMeeting(item.id)}>
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
       </section>
       {showAddModal ? renderAddModal() : null}
       {selectedMeeting ? renderMeetingDetail() : null}
